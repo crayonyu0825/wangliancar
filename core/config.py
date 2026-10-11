@@ -21,6 +21,8 @@ class AppConfig(object):
         self.connect_timeout_sec = max(1.0, float(values.get("connect_timeout_sec", "30")))
         self.scene_id_override = int(values.get("scene_id_override", "0"))
         self.send_control = _as_bool(values.get("send_control", "false"))
+        # Test-only observation acceptance also requires a model SDK adapter.
+        self.behavior_model_mode = _as_bool(values.get("behavior_model_mode", "false"))
         self.evaluation_enabled = _as_bool(values.get("evaluation_enabled", "true"))
         self.evaluation_flush_interval_sec = float(
             values.get("evaluation_flush_interval_sec", "1.0"))

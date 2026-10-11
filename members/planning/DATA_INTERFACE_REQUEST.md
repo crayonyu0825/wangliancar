@@ -1,3 +1,5 @@
+> 2026-10-12：生产最小换道消费者和共用正式合同见 [联合接入](JOINT_IMPLEMENTATION.md)，下文保留此前独立基础与需求历史。
+
 # 下一阶段数据与接口交接请求
 
 2026-10-08：owner 在 [Issue #7 最新回复](https://github.com/lsl1111/wangliancar/issues/7#issuecomment-6051910991) 明确 P01–P09 实现任务，并允许依赖未齐时先交独立算法/测试。本轮基于 main `568e9c9` 推进 L0；与决策 M0 草案对齐的字段、来源/职责、接入验收及能力矩阵见 [新行为分阶段交付](BEHAVIOR_IMPLEMENTATION.md)。任务书中的新增输入仍为需求，公共接口未获批准；下文按日期保留交付历史。

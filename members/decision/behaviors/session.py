@@ -31,6 +31,7 @@ class BehaviorSession(object):
         self._total_retries = 0
         self._last_frame, self._last_time, self._progress = None, None, 0.0
         self._hold_progress = 0.0
+        self._actual_progress_m = 0.0
         self._suspended, self._dispatched = False, False
         self.last_feedback, self.feedback_distinct = None, False
         self.events = []
@@ -119,6 +120,7 @@ class BehaviorSession(object):
         self.last_feedback, self.feedback_distinct = None, False
         self._dispatched = False
         self._hold_progress = 0.0
+        self._actual_progress_m = 0.0
         self._event(frame, reason)
         return self.snapshot(frame)
 
@@ -166,6 +168,7 @@ class BehaviorSession(object):
         self.source_frame_id = frame.frame_id
         self._issued_at_s = frame.observed_at_s
         self._elapsed = self._no_progress = self._progress = self._hold_progress = 0.0
+        self._actual_progress_m = 0.0
         self.last_feedback, self.feedback_distinct = None, False
         self.status, self.reason_code = "REQUESTED", reason
         self._dispatched = False
@@ -189,7 +192,11 @@ class BehaviorSession(object):
         if self.context.key() != frame.context.key():
             return self.finish(frame, False, "TASK_CONTEXT_CHANGED")
         if self._last_frame is not None and frame.frame_id < self._last_frame:
-            return self.finish(frame, False, "GPS_FRAME_ROLLBACK")
+            self._last_frame,self._last_time=frame.frame_id,frame.observed_at_s
+            self._suspended,self._dispatched=True,False
+            self.status,self.reason_code="SUSPENDED","GPS_FRAME_ROLLBACK_REVALIDATE"
+            self._event(frame,self.reason_code)
+            return self.snapshot(frame)
         distinct = self._last_frame is None or frame.frame_id > self._last_frame
         dt = 0.0 if self._last_time is None else frame.observed_at_s - self._last_time
         if dt < 0:
@@ -248,6 +255,10 @@ class BehaviorSession(object):
                 else:
                     if feedback.progress > self._progress:
                         self._progress = feedback.progress
+                        self._no_progress = 0.0
+                    if (feedback.producer in ("control", "runtime")
+                            and feedback.actual_progress_m > self._actual_progress_m + 0.01):
+                        self._actual_progress_m = feedback.actual_progress_m
                         self._no_progress = 0.0
                     if (feedback.producer in ("control", "runtime")
                             and feedback.goal_pose_arrived and feedback.actual_standstill_confirmed

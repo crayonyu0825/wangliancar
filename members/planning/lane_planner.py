@@ -34,7 +34,10 @@ class PlannerSettings(object):
                  curve_recovery_time_s=0.2, rear_offset_m=None, wheelbase_m=None,
                  front_steer_max_rad=None, max_lateral_acceleration_mps2=None,
                  approach_deceleration_ratio=0.5, traffic_stop_margin=0.3,
-                 projection_tolerance_m=2.5, route_ambiguity_m=2.0):
+                 projection_tolerance_m=2.5, route_ambiguity_m=2.0,
+                 behavior_lane_length_min_m=22.0, behavior_transition_time_s=5.0,
+                 behavior_validation_budget_ms=40.0, behavior_point_spacing_m=0.5,
+                 behavior_steer_rate_rad_s=0.8):
         self.spacing = spacing
         self.horizon = horizon
         self.acceleration = acceleration
@@ -59,6 +62,11 @@ class PlannerSettings(object):
         self.traffic_stop_margin = traffic_stop_margin
         self.projection_tolerance_m = projection_tolerance_m
         self.route_ambiguity_m = route_ambiguity_m
+        self.behavior_lane_length_min_m = behavior_lane_length_min_m
+        self.behavior_transition_time_s = behavior_transition_time_s
+        self.behavior_validation_budget_ms = behavior_validation_budget_ms
+        self.behavior_point_spacing_m = behavior_point_spacing_m
+        self.behavior_steer_rate_rad_s = behavior_steer_rate_rad_s
 
     @classmethod
     def from_environment(cls, environ=None):
@@ -79,7 +87,12 @@ class PlannerSettings(object):
                             ("NEVC_PLANNING_LATERAL_MARGIN_M", "lateral_margin_m"),
                             ("NEVC_PLANNING_MOTION_TOLERANCE_MPS", "motion_tolerance_mps"),
                             ("NEVC_PLANNING_LATERAL_GUARD_TIME_S", "lateral_guard_time_s"),
-                            ("NEVC_PLANNING_DECELERATION_MPS2", "deceleration")):
+                            ("NEVC_PLANNING_DECELERATION_MPS2", "deceleration"),
+                            ("NEVC_PLANNING_BEHAVIOR_LANE_LENGTH_MIN_M", "behavior_lane_length_min_m"),
+                            ("NEVC_PLANNING_BEHAVIOR_TRANSITION_TIME_S", "behavior_transition_time_s"),
+                            ("NEVC_PLANNING_BEHAVIOR_VALIDATION_BUDGET_MS", "behavior_validation_budget_ms"),
+                            ("NEVC_PLANNING_BEHAVIOR_POINT_SPACING_M", "behavior_point_spacing_m"),
+                            ("NEVC_PLANNING_BEHAVIOR_STEER_RATE_RAD_S", "behavior_steer_rate_rad_s")):
             if name in environ:
                 try:
                     values[field] = float(environ[name])

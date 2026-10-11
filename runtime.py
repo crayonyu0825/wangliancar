@@ -12,8 +12,9 @@ from core.interfaces import DecisionTarget, Trajectory, ControlOut
 from core.safety_supervisor import SafetySupervisor
 from core.scene_requirements import requires_targets
 from members.control_stub import compute_control, configure_control
-from members.decision_stub import decide, decision_info, decision_settings, reset_decision
-from members.planning_stub import plan, configure_planning
+from members.decision_stub import decide, decision_info, decision_settings, reset_decision, decision_behavior_info
+from members.planning_stub import plan, configure_planning, planning_capabilities
+from core.behavior_exchange import BehaviorExchange
 from perception.perception_builder import PerceptionBuilder
 from perception.route_manager import RouteManager, ROUTE_REFERENCE_VERSION
 from simone_platform.simone_adapter import SimOneAdapter
@@ -94,6 +95,7 @@ class CaptainRuntime(object):
         self._braking_event_count = 0
         self._braking_history = []
         self._braking_io_warned = False
+        self.behavior_exchange = BehaviorExchange()
         planning_settings = configure_planning(config)
         reset_decision()
         _validate_motion_contract(planning_settings, decision_settings())
@@ -137,7 +139,8 @@ class CaptainRuntime(object):
                 self.adapter.load_hdmap()
                 route_manager = RouteManager(self.adapter, self.logger)
                 builder = PerceptionBuilder(
-                    self.adapter, route_manager, self.config.scene_id_override
+                    self.adapter, route_manager, self.config.scene_id_override,
+                    model_mode=getattr(self.config,"behavior_model_mode",False)
                 )
                 info = builder.update_case_info()
                 self.logger.info(
@@ -189,6 +192,7 @@ class CaptainRuntime(object):
                                  perception.frame_id, perception.valid)
             repeated = last_frame == perception.frame_id
             last_frame = perception.frame_id
+            self.behavior_exchange.prepare(perception, planning_capabilities(perception))
             try:
                 decision = _member_output(decide(perception), DecisionTarget, perception)
             except Exception as exc:
@@ -242,6 +246,7 @@ class CaptainRuntime(object):
                     self._warned_no_control = True
                 else:
                     receipt["reason"] = "pipeline_invalid"
+            self.behavior_exchange.finish(perception, trajectory, control, receipt, safety.active)
             # Flush after sending control, so file I/O cannot expire its frame.
             self._flush_evaluation()
             if self.config.publish_json:
@@ -397,6 +402,7 @@ class CaptainRuntime(object):
                 "speed_limits": to_dict(perception.speed_limit_observations),
                 "status": to_dict(perception.map_observation_status)},
             "decision": to_dict(decision), "trajectory": to_dict(trajectory),
+            "behavior_state": decision_behavior_info(),
             "control": to_dict(control), "safety": {
                 "mode": safety.mode, "reason": safety.reason,
                 "candidate": to_dict(safety.control)}, "send": receipt})

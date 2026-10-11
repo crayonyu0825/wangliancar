@@ -14,4 +14,6 @@ def configure_control(config):
 
 
 def compute_control(perception, trajectory):
-    return _engine.compute(perception, trajectory)
+    output = _engine.compute(perception, trajectory)
+    output.execution_feedback = _engine.execution_feedback(perception, trajectory, output)
+    return output

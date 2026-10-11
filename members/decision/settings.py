@@ -19,9 +19,9 @@ FIELDS = (
     "history_max_gap_s", "history_position_jump_m", "history_braking_uncertainty_mps2",
     "behavior_feedback_max_age_s", "behavior_ack_timeout_s", "behavior_progress_timeout_s",
     "behavior_retry_delay_s", "behavior_max_retries", "behavior_observation_gap_s",
-    "signal_dwell_duration_s",
-)
-INT_FIELDS = ("recovery_frames", "release_frames", "history_max_tracks", "history_samples", "behavior_max_retries")
+    "signal_dwell_duration_s", "slow_lead_confirmation_s", "slow_lead_min_advantage_mps",
+    "indicator_lead_s", "maneuver_settle_frames", "trajectory_progress_timeout_s",)
+INT_FIELDS = ("recovery_frames", "release_frames", "history_max_tracks", "history_samples", "behavior_max_retries", "maneuver_settle_frames")
 DEPRECATED = ("launch_ttc_cap", "stop_margin")
 
 
@@ -90,7 +90,9 @@ class DecisionSettings(object):
                  behavior_feedback_max_age_s=0.5, behavior_ack_timeout_s=2.0,
                  behavior_progress_timeout_s=5.0, behavior_retry_delay_s=0.5,
                  behavior_max_retries=2, behavior_observation_gap_s=0.5,
-                 signal_dwell_duration_s=5.1):
+                 signal_dwell_duration_s=5.1, slow_lead_confirmation_s=2.0,
+                 slow_lead_min_advantage_mps=1.5, indicator_lead_s=1.0,
+                 maneuver_settle_frames=3, trajectory_progress_timeout_s=20.0):
         for name in FIELDS:
             setattr(self, name, locals()[name])
 
@@ -114,7 +116,8 @@ class DecisionSettings(object):
                      "history_position_jump_m", "history_braking_uncertainty_mps2",
                      "behavior_feedback_max_age_s", "behavior_ack_timeout_s",
                      "behavior_progress_timeout_s", "behavior_retry_delay_s",
-                     "behavior_observation_gap_s") :
+                     "behavior_observation_gap_s", "slow_lead_confirmation_s",
+                     "slow_lead_min_advantage_mps", "indicator_lead_s", "trajectory_progress_timeout_s") :
             if getattr(self, name) <= 0.0:
                 raise ValueError("decision setting {0} must be positive".format(name))
         if self.front_offset_m is not None and self.front_offset_m <= 0.0:

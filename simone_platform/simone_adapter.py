@@ -208,6 +208,14 @@ class SimOneAdapter(object):
             result.update(self._read_reference_data())
             result.update(self._read_auxiliary_data(result.get("sensor_configurations", [])))
         result["source_status"] = copy.deepcopy(self._source_status)
+        # A coverage/route producer may be explicitly registered by integration.
+        # Sensor range or an empty list is never promoted to full side/rear proof.
+        provider = getattr(self, "behavior_observation_provider", None)
+        try:
+            result["behavior_observations"] = provider(result) if callable(provider) else {}
+        except (ValueError, TypeError, AttributeError, OSError) as exc:
+            result["behavior_observations"] = {}
+            result.setdefault("errors", []).append("BEHAVIOR_OBSERVATION_PROVIDER:"+type(exc).__name__)
         return result
 
     def _read_raw_snapshot(self):

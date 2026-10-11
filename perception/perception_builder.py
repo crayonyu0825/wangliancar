@@ -3,6 +3,7 @@
 import math
 import copy
 import time
+import uuid
 
 from core.geometry import calculate_ttc, speed_2d, world_to_ego, project_polyline
 from core.interfaces import EgoState, Perception, Target
@@ -23,7 +24,7 @@ def _finite_data(value):
 
 
 class PerceptionBuilder(object):
-    def __init__(self, adapter, route_manager, scene_override=0):
+    def __init__(self, adapter, route_manager, scene_override=0, model_mode=False):
         self.adapter = adapter
         self.route_manager = route_manager
         self.scene_override = scene_override
@@ -31,9 +32,15 @@ class PerceptionBuilder(object):
         self.case_id = ""
         self.task_id = ""
         self.scene_id = int(scene_override)
+        self.session_id = uuid.uuid4().hex
+        self.model_mode = bool(model_mode and getattr(adapter, "is_model_adapter", False))
 
     def update_case_info(self):
+        old_context=(self.case_id,self.task_id)
         info = self.adapter.get_case_info()
+        new_context=(info.get("case_id",""),info.get("task_id",""))
+        if any(old_context) and new_context!=old_context:
+            self.session_id=uuid.uuid4().hex
         self.case_name = info.get("case_name", "")
         self.case_id = info.get("case_id", "")
         self.task_id = info.get("task_id", "")
@@ -45,6 +52,9 @@ class PerceptionBuilder(object):
 
     def build_from_raw(self, raw):
         result = Perception()
+        result.session_id = self.session_id
+        result.observed_at_s = time.monotonic()
+        result.observation_mode = "model" if self.model_mode else "production"
         result.case_name, result.case_id = self.case_name, self.case_id
         result.task_id, result.scene_id = self.task_id, self.scene_id
         config = getattr(self.adapter, "config", None)
@@ -236,6 +246,11 @@ class PerceptionBuilder(object):
         if result.ego.valid and result.ego.age_ms >= 0:
             result.valid_until = min(result.valid_until, time.monotonic() +
                                      max(0, timeout - result.ego.age_ms) / 1000.0)
+        try:
+            from perception.behavior_builder import build_behavior_environment
+            result.behavior_environment = build_behavior_environment(result, raw, self.route_manager)
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            result.errors.append("BEHAVIOR_OBSERVATIONS_UNAVAILABLE:" + type(exc).__name__)
         return result
 
     def _build_map_observations(self, result, raw):

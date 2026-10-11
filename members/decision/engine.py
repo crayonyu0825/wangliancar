@@ -17,6 +17,7 @@ from members.decision.constraints import ConstraintSet
 from members.decision.settings import DecisionSettings
 from members.decision.target_history import TargetHistory
 from members.decision.behaviors.coordinator import BehaviorCoordinator
+from members.decision.behaviors.runtime_coordinator import RuntimeCoordinator
 
 
 def _link_frame(perception, output):
@@ -35,8 +36,10 @@ class DecisionEngine(object):
                          else DecisionSettings.from_environment()).validate()
         self.reset()
 
-    def reset(self):
+    def reset(self, preserve_runtime=False):
         self._history = TargetHistory(self.settings)
+        if not preserve_runtime or not hasattr(self, "_runtime_behavior"):
+            self._runtime_behavior = RuntimeCoordinator(self.settings)
         if hasattr(self, "_behavior"):
             self._behavior.reset()
         else:
@@ -61,7 +64,7 @@ class DecisionEngine(object):
     def _observe_frame(self, perception):
         context = (getattr(perception, "case_id", ""),
                    getattr(perception, "task_id", ""),
-                   getattr(perception, "scene_id", 0))
+                   getattr(perception, "scene_id", 0), getattr(perception,"session_id",""))
         frame = (getattr(perception, "frame_id", -1),
                  getattr(perception, "timestamp", 0))
         frame_id = frame[0]
@@ -73,7 +76,10 @@ class DecisionEngine(object):
         if self._context is None:
             self._context = context
         if (context != self._context or rolled_back) and trusted:
-            self.reset()
+            runtime_context = self._runtime_behavior._context
+            preserve = (bool(getattr(perception,"session_id","")) and runtime_context is not None
+                        and perception.session_id == runtime_context[-1])
+            self.reset(preserve_runtime=preserve)
             self._context = context
         distinct = self._last_frame is None or frame_id != self._last_frame[0]
         if trusted:
@@ -88,6 +94,7 @@ class DecisionEngine(object):
             self._last_constraints = None
             self._arbitrate(perception, output, distinct)
             if output.valid and protocol.perception_usable(perception):
+                self._runtime_behavior.update(perception, output, self._last_constraints, self._history, self._clock())
                 try:
                     self._behavior.observe_legacy(perception, output, self._last_constraints, self._clock())
                 except (ValueError, TypeError, AttributeError, KeyError) as exc:
@@ -104,6 +111,10 @@ class DecisionEngine(object):
     def behavior_diagnostics(self):
         result = self._behavior.snapshot()
         result["target_history"] = self._history.snapshot()
+        behavior=self._runtime_behavior
+        result["runtime_behavior"]=dict(phase=behavior.phase,reason_code=behavior.reason,
+            intent_id=behavior.session.intent_id,stage=behavior.session.stage,revision=behavior.session.revision,
+            events=list(behavior.events))
         return result
 
     def _source_reason(self, perception):

@@ -1,3 +1,5 @@
+> 2026-10-12：联合分支的正式运行合同、最小换道接线与当前证据见 [联合实现](JOINT_IMPLEMENTATION.md)。下文是上一轮独立策略/提案的历史记录，不能代替当前接线状态。
+
 > 2026-10-08 补充可执行的 [R05～R09 行为合同提案](BEHAVIOR_HANDOFF.md) 与 [D01～D09 依赖矩阵](BEHAVIOR_IMPLEMENTATION.md)。这些新增类型仅在决策私有模块中，队长未落地公共传输；现有 DecisionTarget/Trajectory 协议仍按下文消费。
 
 # 决策 ↔ 规划 接口现状与交接

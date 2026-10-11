@@ -33,7 +33,12 @@
     "approach_deceleration_ratio": 0.5,
     "traffic_stop_margin": 0.3,
     "projection_tolerance_m": 2.5,
-    "route_ambiguity_m": 2.0
+    "route_ambiguity_m": 2.0,
+    "behavior_lane_length_min_m": 22.0,
+    "behavior_transition_time_s": 5.0,
+    "behavior_validation_budget_ms": 40.0,
+    "behavior_point_spacing_m": 0.5,
+    "behavior_steer_rate_rad_s": 0.8
   },
   "planner_settings_evidence": "explicit_trial_values_not_vehicle_measurements",
   "source_quality_config": {

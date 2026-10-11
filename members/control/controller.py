@@ -42,6 +42,7 @@ class ControlEngine(object):
         self.reset()
 
     def reset(self):
+        self._execution_progress = {}
         self.case = None
         self.last_frame = None
         self.last_time = None
@@ -107,6 +108,48 @@ class ControlEngine(object):
                 2 if self.direction.active_direction == -1 else 0)
         return self._braking_output(output, ego, "HOLD", gear,
                                     getattr(trajectory, "parking_brake_at_stop", False))
+
+    def execution_feedback(self, perception, trajectory, output):
+        from core.behavior_protocol import RuntimeRequest, ExecutionFeedback, GoalPose, behavior_frame
+        request = trajectory.behavior_request
+        if not isinstance(request, RuntimeRequest) or not output.valid:
+            return None
+        if (request.authorization == "EXECUTE_SELECTED" and
+                trajectory.execution_path_id != request.candidate_reference.candidate_id):
+            return None
+        observed = self.clock()
+        frame = behavior_frame(perception, observed)
+        ego = perception.ego
+        pose = GoalPose(ego.x, ego.y, ego.heading)
+        goal = trajectory.goal_pose or request.goal.goal_pose
+        arrived = (goal is not None and math.hypot(ego.x-goal.x, ego.y-goal.y)
+                   <= self.settings.precision_arrival_tolerance_m
+                   and abs(normalize_angle(ego.heading-goal.body_heading_rad))
+                   <= self.settings.precision_heading_tolerance_rad)
+        stopped = ego.speed <= self.settings.gear_standstill_speed_mps
+        hold_complete = (arrived and stopped and self.standstill.anchor is not None
+                         and self.standstill.elapsed >= request.goal.minimum_standstill_duration_s)
+        if not hasattr(self, "_execution_progress"):
+            self._execution_progress = {}
+        identity = (frame.context.key(), request.intent_id, request.stage, request.revision)
+        previous = self._execution_progress.get(identity)
+        distance = 0.0 if previous is None else previous[2]
+        if previous is not None and frame.frame_id > previous[0]:
+            distance += math.hypot(pose.x-previous[1].x, pose.y-previous[1].y)
+        if previous is None or frame.frame_id > previous[0]:
+            self._execution_progress[identity] = (frame.frame_id, pose, distance)
+        while len(self._execution_progress) > 16:
+            self._execution_progress.pop(next(iter(self._execution_progress)))
+        return ExecutionFeedback(frame.context, request.intent_id, request.stage, request.revision,
+            "control", request.source_frame_id, frame.frame_id, frame.observed_at_s, frame.valid_until_s,
+            "COMPLETED" if hold_complete else "ARRIVED" if arrived and stopped else "EXECUTING",
+            usable=True, actual_pose=pose, actual_lane_id=perception.lane.lane_id,
+            actual_standstill_confirmed=stopped, goal_pose_arrived=arrived,
+            standstill_duration_s=self.standstill.elapsed if arrived and stopped else 0.0,
+            hold_completed=hold_complete, motion_direction=trajectory.motion_direction,
+            candidate_id=trajectory.execution_path_id,
+            progress=1.0 if arrived else 0.0, actual_progress_m=distance,
+            evidence_level="observed_pose_and_speed")
 
     def compute(self, perception, trajectory):
         output = ControlOut()

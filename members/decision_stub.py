@@ -2,7 +2,7 @@
 
 from members.decision.engine import DecisionEngine
 
-DECISION_VERSION = "decision-behaviors-m1-on-v10"
+DECISION_VERSION = "decision-joint-behavior-v1"
 _ENGINE = DecisionEngine()
 
 

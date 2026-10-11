@@ -183,6 +183,14 @@ class Perception(object):
 
     def __init__(self):
         self.valid_until = 0.0
+        # Runtime-owned identity and previous-cycle formal feedback. Empty keeps
+        # the legacy forward chain; model inputs require an explicit test mode.
+        self.session_id = ""
+        self.observed_at_s = None
+        self.observation_mode = "production"
+        self.behavior_environment = None
+        self.behavior_capabilities = None
+        self.behavior_feedback = []
         self.ego = EgoState()
         self.targets = []
         self.lane = LaneContext()
@@ -239,6 +247,7 @@ class DecisionTarget(FrameOutput):
     def __init__(self):
         super(DecisionTarget, self).__init__()
         self.mode = DecisionMode.KEEP_LANE
+        self.behavior_request = None
         self.target_speed = 0.0
         self.target_lane_id = ""
         self.stop_distance = -1.0
@@ -266,6 +275,11 @@ class Trajectory(FrameOutput):
     def __init__(self):
         super(Trajectory, self).__init__()
         self.points = []
+        self.behavior_request = None
+        self.planning_feedback = []
+        self.execution_path_id = None
+        self.stop_obligation_id = None
+        self.goal_pose = None
         self.target_speed = 0.0
         self.emergency_stop = False
         self.stop_required = False
@@ -291,6 +305,7 @@ class ControlOut(FrameOutput):
 
     def __init__(self):
         super(ControlOut, self).__init__()
+        self.execution_feedback = None
         self.throttle = 0.0
         self.brake = 0.0
         self.steering = 0.0

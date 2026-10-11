@@ -188,6 +188,28 @@ class RouteManager(object):
             self.logger.warning("车道查询失败: %s", exc)
             return LaneContext()
 
+    def behavior_lane_observations(self, ego):
+        """Real HDMap samples; local markings do not certify a crossing range."""
+        result=[]
+        current=self.last_lane
+        hdmap=self.adapter.hdmap
+        for side,identity in (("current",current.lane_id),("left",current.left_lane_id),("right",current.right_lane_id)):
+            if not identity:
+                continue
+            native=hdmap.pySimString(identity) if hasattr(hdmap,"pySimString") else identity
+            sample=hdmap.getLaneSample(native)
+            if not sample.exists:
+                continue
+            line=_clean_points(_vector_points(sample.laneInfo.centerLine))
+            projection=project_polyline(line,ego.x,ego.y)
+            forward=projection is not None and abs(normalize_angle(projection['heading']-ego.heading))<math.pi/2
+            result.append(dict(lane_id=identity,center_line=line,
+                left_boundary=_vector_points(sample.laneInfo.leftBoundary),
+                right_boundary=_vector_points(sample.laneInfo.rightBoundary),side=side,
+                same_direction=forward,geometry_verified=True,source='hdmap',source_kind='map',
+                marking='UNKNOWN',crossing_range_m=None))
+        return result
+
     def _lookup(self, ego):
         hdmap = self.adapter.hdmap
         position = hdmap.pySimPoint3D(ego.x, ego.y, ego.z)

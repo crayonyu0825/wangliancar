@@ -27,6 +27,10 @@ def validate_output(value, expected, source):
     if not current(value, source):
         raise ValueError("invalid, expired or mismatched source frame")
     if expected is DecisionTarget:
+        if value.behavior_request is not None:
+            from core.behavior_protocol import behavior_frame, validate_runtime_request
+            now=time.monotonic()
+            validate_runtime_request(value.behavior_request,behavior_frame(source,now))
         if (value.mode not in (DecisionMode.KEEP_LANE, DecisionMode.FOLLOW,
                                DecisionMode.STOP, DecisionMode.EMERGENCY_BRAKE)
                 or not number(value.target_speed) or value.target_speed < 0
@@ -43,6 +47,12 @@ def validate_output(value, expected, source):
                        for key, gap in value.obstacle_clearances_m.items())):
             raise ValueError("invalid per-target clearance")
     elif expected is Trajectory:
+        from core.behavior_protocol import RuntimeRequest, PlanningFeedback
+        if value.behavior_request is not None and not isinstance(value.behavior_request,RuntimeRequest):
+            raise ValueError("invalid trajectory behavior request")
+        if (not isinstance(value.planning_feedback,list) or any(not isinstance(v,PlanningFeedback)
+                for v in value.planning_feedback)):
+            raise ValueError("invalid planning feedback")
         if (not number(value.target_speed) or value.target_speed < 0
                 or len(value.points) < 2 or type(value.emergency_stop) is not bool
                 or type(value.stop_required) is not bool
