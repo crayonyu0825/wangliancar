@@ -83,7 +83,7 @@ class SignalDwellPolicy(object):
             self._stop_id, self._arrived, self._phase = observation.stop_id, False, "APPROACH"
         goal = BehaviorGoal(goal_pose=observation.goal_pose,
                             speed_cap_mps=0.0 if self._arrived else observation.speed_cap_mps,
-                            stop_distance_m=observation.stop_distance_m,
+                            stop_distance_m=0.0 if self._arrived else observation.stop_distance_m,
                             precision_stop=True,
                             minimum_standstill_duration_s=self.minimum_duration_s,
                             stop_obligation_id="signal:" + observation.stop_id)
@@ -121,7 +121,7 @@ class BlockingObservation(object):
     def __init__(self, blockage_id, stop_distance_m, verified_blockage,
                  alternative_status="unknown", ordinary_follow=False,
                  signal_only=False, verified_clear=False, usable=True,
-                 speed_cap_mps=0.0):
+                 speed_cap_mps=0.0, source=None, source_frame_id=None, source_observed_at_s=None):
         require(isinstance(blockage_id, str) and bool(blockage_id), "invalid blockage ID")
         require(stop_distance_m is None or finite(stop_distance_m) and stop_distance_m >= 0,
                 "invalid blockage stop")
@@ -129,10 +129,14 @@ class BlockingObservation(object):
         require(all(type(v) is bool for v in (verified_blockage, ordinary_follow, signal_only,
                                               verified_clear, usable)), "invalid blockage flags")
         require(finite(speed_cap_mps) and speed_cap_mps >= 0, "invalid blockage cap")
+        require(all(v is None for v in (source, source_frame_id, source_observed_at_s)) or
+                isinstance(source, str) and bool(source) and type(source_frame_id) is int and source_frame_id >= 0
+                and finite(source_observed_at_s) and source_observed_at_s >= 0, 'invalid blockage source identity')
         self.blockage_id, self.stop_distance_m = blockage_id, stop_distance_m
         self.verified_blockage, self.alternative_status = verified_blockage, alternative_status
         self.ordinary_follow, self.signal_only = ordinary_follow, signal_only
         self.verified_clear, self.usable, self.speed_cap_mps = verified_clear, usable, speed_cap_mps
+        self.source, self.source_frame_id, self.source_observed_at_s = source, source_frame_id, source_observed_at_s
 
 
 class BlockedRoadPolicy(object):
@@ -144,9 +148,11 @@ class BlockedRoadPolicy(object):
     def reset(self):
         self.session.reset()
         self._context, self._last_frame, self._clear = None, None, 0
+        self._clear_source = None
 
     def evaluate(self, frame, observation, capabilities=None, feedback=None, safety_override=False):
         if not frame.current(frame.observed_at_s):
+            self._clear, self._clear_source = 0, None
             request = self.session.tick(frame, capabilities, safety_override=True) if self.session.intent_id else None
             return PolicyResult(request, bool(request), "OBSERVATION_UNUSABLE", "SUSPENDED")
         if self._context != frame.context.key():
@@ -160,6 +166,7 @@ class BlockedRoadPolicy(object):
         distinct = self._last_frame is None or frame.frame_id > self._last_frame
         self._last_frame = frame.frame_id
         if observation is None or not isinstance(observation, BlockingObservation) or not observation.usable:
+            self._clear, self._clear_source = 0, None
             if self.session.intent_id:
                 request = self.session.tick(frame, capabilities, safety_override=True)
                 return PolicyResult(request, True, "BLOCKAGE_EVIDENCE_UNKNOWN", "BLOCKED")
@@ -168,19 +175,33 @@ class BlockedRoadPolicy(object):
                     or observation.alternative_status == "feasible")
         if excluded:
             self._clear = 0
+            self._clear_source = None
             if self.session.intent_id:
                 request = self.session.finish(frame, False, "NOT_UNRESOLVED_BLOCKAGE")
                 return PolicyResult(request, False, request.reason_code, "CANCELLED")
             return PolicyResult(reason="NOT_UNRESOLVED_BLOCKAGE")
         if observation.verified_clear:
-            if distinct and frame.current(frame.observed_at_s) and not frame.paused and not safety_override:
+            source = ((observation.source, observation.source_frame_id, observation.source_observed_at_s)
+                      if observation.source is not None else ('legacy_explicit_frame', frame.frame_id, frame.observed_at_s))
+            prior = self._clear_source
+            fresh = prior is None or (source[0] == prior[0] and source[1] > prior[1] and source[2] > prior[2])
+            repeated = source == prior
+            if prior is not None and not fresh and not repeated:
+                self._clear = 0
+                fresh = source[0] != prior[0]
+            if (not frame.current(frame.observed_at_s) or frame.paused or safety_override
+                    or source[1] > frame.frame_id or source[2] > frame.observed_at_s):
+                self._clear, self._clear_source = 0, None
+            elif distinct and fresh:
                 self._clear += 1
+                self._clear_source = source
             if self.session.intent_id and self._clear >= self.clear_frames:
                 request = self.session.finish(frame, True, "BLOCKAGE_CLEARED")
                 return PolicyResult(request, False, request.reason_code, "COMPLETE")
             request = self.session.tick(frame, capabilities, feedback, safety_override) if self.session.intent_id else None
             return PolicyResult(request, bool(request), "BLOCKAGE_CLEAR_CONFIRMING", "HOLD")
         self._clear = 0
+        self._clear_source = None
         if not observation.verified_blockage or observation.stop_distance_m is None:
             return PolicyResult(reason="BLOCKAGE_BOUNDARY_UNVERIFIED")
         goal = BehaviorGoal(stop_distance_m=observation.stop_distance_m,

@@ -7,7 +7,16 @@ from members.decision.behaviors.contract import Capabilities, GoalPose
 from members.decision.behaviors.observations import Evidence, MotionObject
 from members.decision.behaviors.lane_change import LaneCandidate, LaneChangePolicy
 from members.decision.behaviors.parking import ParkingSpace, ParkingFacts, ParkingPolicy
-from tests.test_decision_behavior_contract import frame, feedback
+from tests.test_decision_behavior_contract import frame, feedback as contract_feedback
+
+
+def feedback(request, f, **changes):
+    # These are authored synthetic stopped-pose observations. Parking cases
+    # explicitly report the direction of the stage they model; the generic
+    # contract fixture's forward default is not reverse execution evidence.
+    if request.maneuver == 'PARK':
+        changes.setdefault('motion_direction', request.goal.motion_direction)
+    return contract_feedback(request, f, **changes)
 
 
 def evidence(f, covered=True):
@@ -23,7 +32,8 @@ def caps(f):
 def lane(f, objects=(), marking="DASHED", allowed=True, forward=True, rear=True):
     return LaneCandidate("left", "left", [(-150.0, 3.5), (200.0, 3.5)], 3.5,
                          marking, allowed, forward, evidence(f), rear, objects,
-                         [(-150.0,5.25),(200.0,5.25)],[(-150.0,1.75),(200.0,1.75)])
+                         [(-150.0,5.25),(200.0,5.25)],[(-150.0,1.75),(200.0,1.75)],
+                         is_current_lane=f.ego_y>=1.75)
 
 
 def parking(f, occupancy="empty", boundary=None, objects=(), rear=True, signed=0.0):
@@ -43,7 +53,7 @@ class ManeuverPolicyTests(unittest.TestCase):
         front = MotionObject(2,15,3.5,0,0,4,2)
         self.assertIn("REAR", policy.opportunity(f,lane(f,[rear]))[1])
         self.assertIn("FRONT", policy.opportunity(f,lane(f,[front]))[1])
-        unknown = policy.evaluate(f,"avoid:1","AVOID",[lane(f,rear=False)],caps(f))
+        unknown = policy.evaluate(f,"avoid:1","AVOID",[lane(f,rear=False)],caps(f),speed_cap_mps=5.)
         self.assertIsNone(unknown.request)
         self.assertEqual("BLOCKED",unknown.phase)
 
@@ -53,7 +63,7 @@ class ManeuverPolicyTests(unittest.TestCase):
         safe=LaneCandidate("right","right",[(-150,-3.5),(200,-3.5)],3.5,"DASHED",True,True,evidence(f),True,(),
                            [(-150,-1.75),(200,-1.75)],[(-150,-5.25),(200,-5.25)])
         policy=LaneChangePolicy(3.5,0.9,0.9)
-        result=policy.evaluate(f,"avoid","AVOID",[blocked,safe],caps(f))
+        result=policy.evaluate(f,"avoid","AVOID",[blocked,safe],caps(f),speed_cap_mps=5.)
         self.assertEqual("right",result.request.goal.target_lane_id)
         f=frame(2,0.1,speed=5.0)
         refreshed=lane(f)
@@ -64,13 +74,13 @@ class ManeuverPolicyTests(unittest.TestCase):
     def test_solid_and_opposite_candidates_never_dispatch(self):
         for candidate_args in ({"marking":"SOLID"},{"forward":False},{"allowed":False}):
             f=frame()
-            result=LaneChangePolicy(3.5,0.9,0.9).evaluate(f,"merge","MERGE",[lane(f,**candidate_args)],caps(f))
+            result=LaneChangePolicy(3.5,0.9,0.9).evaluate(f,"merge","MERGE",[lane(f,**candidate_args)],caps(f),speed_cap_mps=5.)
             self.assertIsNone(result.request)
 
     def test_lane_phases_need_actual_indicator_path_and_settlement_feedback(self):
         policy=LaneChangePolicy(3.5,0.9,0.9)
         f=frame(speed=5.0)
-        r=policy.evaluate(f,"avoid:1","AVOID",[lane(f)],caps(f)).request
+        r=policy.evaluate(f,"avoid:1","AVOID",[lane(f)],caps(f),speed_cap_mps=5.).request
         self.assertEqual("PREPARE",r.stage)
         f=frame(2,0.1,speed=5.0)
         r=policy.evaluate(f,"avoid:1","AVOID",[lane(f)],caps(f),feedback(r,f,producer="control",status="EXECUTING",
@@ -87,6 +97,7 @@ class ManeuverPolicyTests(unittest.TestCase):
         self.assertEqual("EXECUTE",unchanged.stage)
         for index in (6,7,8):
             f=frame(index,(index-1)*0.1,speed=5.0)
+            f.ego_x,f.ego_y=5.,3.5
             result=policy.evaluate(f,"avoid:1","AVOID",[lane(f)],caps(f),feedback(policy.session.snapshot(f),f,
                  producer="control",status="EXECUTING",progress=0.9,actual_lane_id="left",actual_pose=GoalPose(5,3.5,0)))
         self.assertEqual("COMPLETED",result.request.status)
@@ -97,7 +108,7 @@ class ManeuverPolicyTests(unittest.TestCase):
     def test_execution_obstruction_requires_recovery_path_not_snap_back(self):
         policy=LaneChangePolicy(3.5,0.9,0.9)
         f=frame()
-        policy.evaluate(f,"change","LANE_CHANGE",[lane(f)],caps(f))
+        policy.evaluate(f,"change","LANE_CHANGE",[lane(f)],caps(f),speed_cap_mps=2.)
         policy.session.advance(f,"EXECUTE")
         f=frame(2,0.1)
         blocked=policy.evaluate(f,"change","LANE_CHANGE",[lane(f,[MotionObject(1,5,3.5,0,0,4,2)])],caps(f))
@@ -110,7 +121,7 @@ class ManeuverPolicyTests(unittest.TestCase):
     def test_execution_recovery_requests_new_path_and_restores_indicator_with_finite_retries(self):
         policy=LaneChangePolicy(3.5,0.9,0.9)
         f=frame()
-        initial=policy.evaluate(f,"change","LANE_CHANGE",[lane(f)],caps(f))
+        initial=policy.evaluate(f,"change","LANE_CHANGE",[lane(f)],caps(f),speed_cap_mps=2.)
         policy.session.advance(f,"EXECUTE")
         for cycle in range(3):
             blocked_frame=frame(2+cycle*2,0.1+cycle*0.2)
@@ -143,7 +154,7 @@ class ManeuverPolicyTests(unittest.TestCase):
     def test_lane_settlement_requires_entire_body_inside_not_only_rear_axle(self):
         policy=LaneChangePolicy(3.5,0.9,0.9)
         f=frame()
-        policy.evaluate(f,"change","LANE_CHANGE",[lane(f)],caps(f))
+        policy.evaluate(f,"change","LANE_CHANGE",[lane(f)],caps(f),speed_cap_mps=2.)
         r=policy.session.advance(f,"EXECUTE")
         f=frame(2,0.1)
         result=policy.evaluate(f,"change","LANE_CHANGE",[lane(f)],caps(f),feedback(r,f,
@@ -210,32 +221,38 @@ class ManeuverPolicyTests(unittest.TestCase):
         r=policy.evaluate(f,parking(f),caps(f),feedback(r,f)).request
         self.assertEqual("POSITION",r.stage)
         f=frame(4,0.3)
+        f.ego_x=15.
         r=policy.evaluate(f,parking(f),caps(f),feedback(r,f,producer="control",status="ARRIVED",
              goal_pose_arrived=True,actual_standstill_confirmed=True,actual_pose=GoalPose(15,0,0),progress=1)).request
         self.assertEqual("REVERSE_ENTRY",r.stage)
         self.assertEqual(-1,r.goal.motion_direction)
         obligation=r.goal.stop_obligation_id
         f=frame(5,0.4)
+        f.ego_x=policy.park_goal.x
         r=policy.evaluate(f,parking(f),caps(f),feedback(r,f,producer="control",status="ARRIVED",
              goal_pose_arrived=True,actual_standstill_confirmed=True,actual_pose=policy.park_goal,progress=1)).request
         self.assertEqual("PARKED_DWELL",r.stage)
         self.assertEqual(obligation,r.goal.stop_obligation_id)
         f=frame(6,0.5)
+        f.ego_x=policy.park_goal.x
         r=policy.evaluate(f,parking(f),caps(f),feedback(r,f,producer="control",status="COMPLETED",
              goal_pose_arrived=True,actual_standstill_confirmed=True,actual_pose=policy.park_goal,
              progress=1,hold_completed=True,standstill_duration_s=9)).request
         self.assertEqual("PARKED_DWELL",r.stage)
         f=frame(7,0.6)
+        f.ego_x=policy.park_goal.x
         r=policy.evaluate(f,parking(f),caps(f),feedback(r,f,producer="control",status="COMPLETED",
              goal_pose_arrived=True,actual_standstill_confirmed=True,actual_pose=policy.park_goal,
              progress=1,hold_completed=True,standstill_duration_s=10)).request
         self.assertEqual("EXIT_PREPARE",r.stage)
         f=frame(8,0.7)
+        f.ego_x=policy.park_goal.x
         r=policy.evaluate(f,parking(f),caps(f),feedback(r,f,producer="control",status="ARRIVED",
              goal_pose_arrived=True,actual_standstill_confirmed=True,actual_pose=policy.park_goal)).request
         self.assertEqual("EXIT",r.stage)
         self.assertEqual(1,r.goal.motion_direction)
         f=frame(9,0.8)
+        f.ego_x=25.
         r=policy.evaluate(f,parking(f),caps(f),feedback(r,f,producer="control",status="ARRIVED",
              goal_pose_arrived=True,actual_standstill_confirmed=True,actual_pose=GoalPose(25,0,0),progress=1)).request
         self.assertEqual("COMPLETED",r.status)
@@ -274,6 +291,7 @@ class ManeuverPolicyTests(unittest.TestCase):
         self.assertIs(original_goal, policy.park_goal)
         self.assertGreater(recovered.request.goal.speed_cap_mps, 0)
         f = frame(4, 0.3)
+        f.ego_x=original_goal.x
         arrived = policy.evaluate(f, parking(f), caps(f), feedback(recovered.request, f,
             producer="control", status="ARRIVED", actual_standstill_confirmed=True,
             goal_pose_arrived=True, actual_pose=original_goal, progress=1))
@@ -323,6 +341,7 @@ class ManeuverPolicyTests(unittest.TestCase):
         self.assertEqual("PARKED_DWELL", held.request.stage)
         self.assertTrue(held.hold_required)
         f = frame(3, 0.2)
+        f.ego_x=goal.x
         completed = policy.evaluate(f, parking(f), caps(f), feedback(held.request, f,
             producer="control", status="COMPLETED", actual_standstill_confirmed=True,
             goal_pose_arrived=True, actual_pose=goal, progress=1,

@@ -9,6 +9,8 @@ from core.geometry import (nearest_path_error, normalize_angle, project_polyline
                            projection_within_polyline, DEFAULT_FORWARD_HEADING_ERROR_RAD)
 from core.interfaces import LaneContext
 from core.route_segments import verified_spans
+from core.region_geometry import simple_outline
+from perception.maneuver_map import ManeuverMap
 
 
 def _sdk_string(value):
@@ -143,6 +145,12 @@ class RouteManager(object):
         self._retired_branch_ids = {}
         self._last_ego = None
         self._last_ego_at = None
+        self._neighbor_samples = {}
+        self._neighbor_sample_at = 0.0
+        self._maneuver_map = ManeuverMap(adapter)
+
+    def read_maneuver_map(self,ego,lane,neighbors):
+        return self._maneuver_map.observe(ego,lane,neighbors)
 
     def set_route_hint(self, points, valid, context=None):
         """Static task waypoints select branches; they are not trajectory points."""
@@ -161,6 +169,108 @@ class RouteManager(object):
             self._retired_branch_ids.clear()
             self._last_ego = None
             self._last_ego_at = None
+            self._neighbor_samples.clear()
+
+    def read_neighbor_lanes(self, ego, lane):
+        """Detached adjacent geometry; no inference that a lane is empty.
+
+        Reuse the existing sample cleaning/orientation and native ID handling.
+        Only same-road/section OpenDRIVE lane signs prove nominal direction;
+        unknown IDs, road type or shared boundary remain explicitly unknown.
+        A marking query applies at the ego position, not to the full corridor.
+        """
+        hdmap = getattr(self.adapter, "hdmap", None)
+        if (not ego.valid or not lane.valid or not self.adapter.map_loaded
+                or hdmap is None or not hasattr(hdmap, "pySimString")):
+            return []
+        result = []
+        now = time.monotonic()
+        if now-self._neighbor_sample_at >= self.refresh_sec:
+            self._neighbor_samples.clear()
+            self._neighbor_sample_at = now
+        for side, identity, mark in (("left",lane.left_lane_id,lane.left_mark_type),
+                                     ("right",lane.right_lane_id,lane.right_mark_type)):
+            if not identity:
+                continue
+            item = dict(lane_id=identity, side=side, source="hdmap", geometry_valid=False,
+                        center_line=[], left_boundary=[], right_boundary=[], width_m=None,
+                        direction_verified=False, same_direction=False, lane_type="unknown",
+                        shared_marking=str(mark), marking_scope="ego_position_only",
+                        crossing_allowed_at_ego=False, crossing_range_verified=False,
+                        reason="unavailable")
+            try:
+                key = (id(hdmap),lane.lane_id,identity)
+                native = hdmap.pySimString(identity)
+                if key not in self._neighbor_samples:
+                    sample = hdmap.getLaneSample(native)
+                    if not sample.exists:
+                        raise ValueError("neighbor sample unavailable")
+                    raw = tuple(_clean_points(_vector_points(v)) for v in
+                        (sample.laneInfo.centerLine,sample.laneInfo.leftBoundary,
+                         sample.laneInfo.rightBoundary))
+                    kind = "unknown"
+                    if hasattr(hdmap,"getLaneType"):
+                        lane_type = hdmap.getLaneType(native)
+                        if getattr(lane_type,"exists",False):
+                            kind = _sdk_string(lane_type.laneType)
+                    self._neighbor_samples[key] = raw+(kind,)
+                center,left,right,kind = self._neighbor_samples[key]
+                center = _orient_forward(center,ego.heading,ego.x,ego.y)
+                reversed_sample = center[0] != self._neighbor_samples[key][0][0]
+                if reversed_sample:
+                    left,right = list(reversed(right)),list(reversed(left))
+                simple_outline([tuple(v[:2]) for v in left]+[tuple(v[:2]) for v in reversed(right)])
+                projection = project_polyline(center,ego.x,ego.y)
+                if not projection_within_polyline(projection,len(center)):
+                    raise ValueError("ego outside neighbor longitudinal coverage")
+                i,t = projection["index"],projection["ratio"]
+                z = center[i][2]+t*(center[i+1][2]-center[i][2])
+                if abs(z-ego.z) > JOIN_HEIGHT_TOLERANCE_M:
+                    raise ValueError("neighbor on another height level")
+                width = hdmap.getLaneWidth(native,hdmap.pySimPoint3D(*center[i]))
+                if not width.exists or not math.isfinite(float(width.width)) or width.width <= .1:
+                    raise ValueError("neighbor width unavailable")
+                item.update(center_line=center,left_boundary=left,right_boundary=right,
+                            width_m=float(width.width),geometry_valid=True,lane_type=kind,
+                            native_sample_reversed=bool(reversed_sample),reason="geometry_observed")
+                try:
+                    a,b = tuple(int(v) for v in lane.lane_id.split("_")),tuple(int(v) for v in identity.split("_"))
+                    item["direction_verified"] = len(a)==len(b)==3 and a[:2]==b[:2] and a[2]!=0 and b[2]!=0
+                    item["same_direction"] = item["direction_verified"] and a[2]*b[2]>0
+                except (ValueError,TypeError):
+                    pass
+                shared = right if side=="left" else left
+                current = lane.left_boundary if side=="left" else lane.right_boundary
+                p,q = project_polyline(shared,ego.x,ego.y),project_polyline(current,ego.x,ego.y)
+                boundary_verified = (p is not None and q is not None
+                    and math.hypot(p["point"][0]-q["point"][0],p["point"][1]-q["point"][1]) <= JOIN_POSITION_TOLERANCE_M)
+                item["shared_boundary_verified"] = boundary_verified
+                label = str(mark).lower().split(".")[-1]
+                item["crossing_allowed_at_ego"] = (item["same_direction"] and boundary_verified
+                    and kind.lower().split(".")[-1]=="driving" and label in ("broken","dashed","dashline"))
+                # Publish native marking extent facts, without confusing the
+                # lane-centre s with OpenDRIVE road/section s. The legacy SDK
+                # does not expose section origin or permitted crossing spans.
+                if hasattr(hdmap,"getRoadMark"):
+                    observed = hdmap.getRoadMark(hdmap.pySimPoint3D(ego.x,ego.y,ego.z),
+                                                hdmap.pySimString(lane.lane_id))
+                    raw_current = _clean_points(_vector_points(hdmap.getLaneSample(
+                        hdmap.pySimString(lane.lane_id)).laneInfo.centerLine))
+                    origin = project_polyline(raw_current,ego.x,ego.y)
+                    reverse_current = origin and math.cos(origin["heading"]-ego.heading)<0
+                    native_side = ("right" if side=="left" else "left") if reverse_current else side
+                    value = getattr(observed,native_side,None) if observed.exists else None
+                    if value is not None:
+                        extent = [getattr(value,n,None) for n in ("sOffset","length")]
+                        extent = [v if type(v) in (int,float) and math.isfinite(v) and v>=0 else None for v in extent]
+                        item["marking_observation"] = dict(type=_sdk_string(value.type),
+                            section_s_offset_m=extent[0],native_length_m=extent[1],
+                            native_side=native_side,
+                            semantics="native_extent_not_crossing_authority")
+            except (AttributeError,TypeError,ValueError,OverflowError,RuntimeError) as exc:
+                item["reason"] = "NEIGHBOR_QUERY:"+str(exc)
+            result.append(item)
+        return result
 
     def update(self, ego, force=False):
         if not ego.valid or not self.adapter.map_loaded:
@@ -257,6 +367,14 @@ class RouteManager(object):
         )
         lane.valid = project_polyline(lane.center_line, ego.x, ego.y) is not None
         lane.source = "hdmap"
+        if hasattr(hdmap,"getLaneType"):
+            try:
+                kind = hdmap.getLaneType(native_id)
+                if getattr(kind,"exists",False):
+                    lane.lane_type = _sdk_string(kind.laneType)
+                    lane.lane_type_valid = lane.lane_type.lower().split(".")[-1]!="unknown"
+            except (AttributeError,TypeError,ValueError,RuntimeError):
+                pass
         if lane.valid:
             self._extend_reference(lane, ego, link_info, reversed_direction)
         return lane

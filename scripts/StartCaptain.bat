@@ -1,7 +1,11 @@
 @echo off
 setlocal
 set "PROJECT_DIR=%~dp0.."
-set "PYTHON_EXE=E:\Sim-One\Tools\python36\python.exe"
+if defined NEVC_PYTHON_EXE (
+  set "PYTHON_EXE=%NEVC_PYTHON_EXE%"
+) else (
+  set "PYTHON_EXE=E:\Sim-One\Tools\python36\python.exe"
+)
 set "LAUNCH_LOG=%PROJECT_DIR%\runtime_data\launcher.log"
 set "CONSOLE_LOG=%PROJECT_DIR%\runtime_data\captain-console-%RANDOM%-%RANDOM%.log"
 rem Decision API uses m/s: 30 km/h = 8.333333333333334 m/s.

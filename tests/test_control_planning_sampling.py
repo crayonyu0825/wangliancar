@@ -115,6 +115,34 @@ class ControlPlanningSamplingTests(unittest.TestCase):
             self.assertEqual(0., c.throttle)
             self.assertGreater(c.brake, 0.)
 
+    def test_retained_zero_start_profile_keeps_launch_after_small_motion(self):
+        for positions in ((0., 2., 8.), (0., .0001, .02, .2, 1., 2., 8.)):
+            points = [(s, 0., min(.8, math.sqrt(2.*s))) for s in positions]
+            for progress in (0., .0001, .001, .02, .2):
+                p, t = inputs(speed=0., x=progress, points=points)
+                t.target_speed = .8
+                c = ControlEngine(calibration()).compute(p, t)
+                self.assertTrue(c.valid, c.errors)
+                self.assertGreater(c.diagnostics['reference_speed_mps'], .5)
+                self.assertGreater(c.throttle, 0.)
+                self.assertEqual(0., c.brake)
+
+    def test_retained_launch_stops_at_first_falling_profile_and_internal_zero(self):
+        points = [(0.,0.,0.), (.2,0.,.4), (.4,0.,.1),
+                  (.6,0.,0.), (.8,0.,.8), (2.,0.,.8)]
+        for progress in (.3, .4, .6):
+            p, t = inputs(speed=.3, x=progress, points=points)
+            t.target_speed = .8
+            path = PreparedPath(t.points, 12.)
+            reference, _ = path.speed_reference(progress, t, ControllerSettings())
+            self.assertLessEqual(reference, path.sample(progress)[2])
+        p, t = inputs(speed=0., x=.6, points=points)
+        t.target_speed = .8
+        c = ControlEngine(calibration()).compute(p, t)
+        self.assertTrue(c.valid, c.errors)
+        self.assertEqual(0., c.throttle)
+        self.assertEqual('HOLD', c.diagnostics['state'])
+
     def test_neutral_stop_profile_can_release_stored_brake_integral(self):
         now = [0.]
         control = ControlEngine(calibration(), clock=lambda: now[0])

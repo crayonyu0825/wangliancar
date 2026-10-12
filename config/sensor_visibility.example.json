@@ -1,0 +1,14 @@
+{
+  "version": "sensor-visibility-v1",
+  "profiles": [],
+  "documentation": {
+    "purpose": "Schema reference only. Empty profiles produce unknown coverage.",
+    "required_profile_fields": [
+      "task_id", "case_id", "vehicle_id", "sensor_id", "installation",
+      "complete_detections", "verification_reference", "body_region_m"
+    ],
+    "installation_fields_sdk_native_units": ["type", "x", "y", "z", "roll", "pitch", "yaw", "hz"],
+    "body_coordinates": "metres, x forward, y left",
+    "complete_detections_requirement": "Verified complete object detection throughout this region under applicable occlusion conditions. Do not infer it from an empty packet or FOV alone."
+  }
+}

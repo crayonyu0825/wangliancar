@@ -15,6 +15,7 @@ import time
 
 from core.geometry import normalize_angle
 from core.validation import number
+from members.planning.corridor_region import CorridorRegion,NumericResolution,PreparationLimit
 
 
 EPS = 1e-9
@@ -65,6 +66,31 @@ class ValidationBudget(object):
         self.deadline_monotonic_s = deadline_monotonic_s
 
 
+class ExecutionEnvelope(object):
+    """Caller-verified tracking bounds; presence is not platform calibration.
+
+    At nominal progress/time t, actual rear-axle position can differ by a disk
+    of position_error_m, body yaw by heading_error_rad, and execution time by
+    [-early_time_s,+late_time_s]. These are occupancy bounds, not a claim that
+    the controller follows absolute timestamps or that actuator errors vanish.
+    """
+    def __init__(self, position_error_m, heading_error_rad, early_time_s, late_time_s):
+        self.position_error_m = position_error_m
+        self.heading_error_rad = heading_error_rad
+        self.early_time_s = early_time_s
+        self.late_time_s = late_time_s
+
+
+def validate_execution_envelope(envelope):
+    if not isinstance(envelope, ExecutionEnvelope):
+        _invalid('explicit ExecutionEnvelope required for execution-time claims')
+    for name in ('position_error_m', 'heading_error_rad', 'early_time_s', 'late_time_s'):
+        _positive(name, getattr(envelope, name), True)
+    if envelope.heading_error_rad > math.pi:
+        _invalid('execution heading bound must be at most pi')
+    return envelope
+
+
 class _Stop(Exception):
     def __init__(self, status, code, constraint, **details):
         self.status, self.code, self.constraint, self.details = status, code, constraint, details
@@ -104,6 +130,8 @@ def _edges(polygon):
 
 
 def _corridor(raw, checks):
+    if isinstance(raw,CorridorRegion):
+        return raw.prepare(checks.consume,checks.budget.max_checks)
     if not isinstance(raw, (list, tuple)) or len(raw) < 3:
         _invalid("explicit convex corridor polygon required")
     polygon = []
@@ -154,10 +182,12 @@ def _polygon_gap(first, second):
     for polygon in (first, second):
         for a, b in _edges(polygon):
             length = math.hypot(b[0]-a[0], b[1]-a[1])
+            _positive('distance edge length',length)
             nx, ny = -(b[1]-a[1])/length, (b[0]-a[0])/length
             # Translate before projecting to reduce cancellation in world XY.
             pa = [(p[0]-a[0])*nx + (p[1]-a[1])*ny for p in first]
             pb = [(p[0]-a[0])*nx + (p[1]-a[1])*ny for p in second]
+            _finite(pa+pb)
             gap = max(gap, min(pb)-max(pa), min(pa)-max(pb))
     if gap <= 0:
         return 0.
@@ -169,8 +199,13 @@ def _polygon_gap(first, second):
             for a, b in _edges(boundary):
                 dx, dy = b[0]-a[0], b[1]-a[1]
                 px, py = point[0]-a[0], point[1]-a[1]
-                ratio = max(0., min(1., (px*dx+py*dy)/(dx*dx+dy*dy)))
-                distance = min(distance, math.hypot(px-ratio*dx, py-ratio*dy))
+                length=math.hypot(dx,dy)
+                _positive('distance edge length',length)
+                ux,uy=dx/length,dy/length
+                projection=px*ux+py*uy
+                _finite((px,py,projection))
+                along=max(0.,min(length,projection))
+                distance = min(distance, math.hypot(px-along*ux,py-along*uy))
     return distance
 
 
@@ -185,9 +220,15 @@ def _circle_gap(polygon, x, y, radius):
     return -radius if inside else distance-radius
 
 
-def _obstacle_gap(body, obstacle, at):
+def _obstacle_gap(body, obstacle, at, execution=None):
     x, y = obstacle.x+obstacle.vx*at, obstacle.y+obstacle.vy*at
     uncertainty = obstacle.position_uncertainty_m + obstacle.velocity_uncertainty_mps*at
+    if execution is not None:
+        # Cover every allowed execution timestamp using a Minkowski disk.
+        # Target uncertainty is evaluated at the latest allowed instant.
+        uncertainty += (math.hypot(obstacle.vx, obstacle.vy)*
+                        max(execution.early_time_s, execution.late_time_s)
+                        + obstacle.velocity_uncertainty_mps*execution.late_time_s)
     _finite((x, y, uncertainty))
     if obstacle.heading is None:
         return _circle_gap(body, x, y, math.hypot(obstacle.length, obstacle.width)*.5 + uncertainty)
@@ -307,8 +348,10 @@ def _pose(segment, at):
     return (a[0]+u*(b[0]-a[0]), a[1]+u*(b[1]-a[1]), a[2]+u*turn), u
 
 
-def _sweep(segments, vehicle, planes, obstacles, checks):
+def _sweep(segments, vehicle, planes, obstacles, checks, execution=None):
     radius = math.hypot(max(vehicle.front_offset_m, vehicle.rear_offset_m), vehicle.half_width_m)
+    error = (execution.position_error_m + 2*radius*math.sin(execution.heading_error_rad*.5)
+             if execution is not None else 0.)
     minimum = float("inf")
 
     def gaps(segment, at):
@@ -316,14 +359,16 @@ def _sweep(segments, vehicle, planes, obstacles, checks):
         pose, u = _pose(segment, at)
         body = _rectangle(pose[0], pose[1], pose[2], vehicle.front_offset_m,
                           vehicle.rear_offset_m, vehicle.half_width_m)
-        road = min((p[0]-origin[0])*normal[0]+(p[1]-origin[1])*normal[1]
-                   for origin, normal in planes for p in body)
+        road = (planes.gap(body,pose[:2],checks.consume) if hasattr(planes,'gap') else
+                min((p[0]-origin[0])*normal[0]+(p[1]-origin[1])*normal[1]
+                    for origin, normal in planes for p in body))
+        road -= error
         if road <= EPS:
             raise _Stop("unsafe", "CORRIDOR_COLLISION", "corridor", relative_time_s=at)
         result = [road]
         for obstacle in obstacles:
             checks.consume()
-            gap = _obstacle_gap(body, obstacle, at)
+            gap = _obstacle_gap(body, obstacle, at, execution)-error
             if gap <= EPS:
                 raise _Stop("unsafe", "OBSTACLE_COLLISION", "collision",
                             obstacle_id=obstacle.identity, relative_time_s=at)
@@ -364,11 +409,13 @@ def _sweep(segments, vehicle, planes, obstacles, checks):
     return minimum
 
 
-def validate_candidate(points, motion_direction, vehicle, limits, corridor, obstacles, budget):
+def validate_candidate(points, motion_direction, vehicle, limits, corridor, obstacles, budget,
+                       execution_envelope=None):
     """Return a detached model-scoped report; never mutate/rebind a trajectory."""
     started, checks = time.monotonic(), None
     report = {"status": "invalid", "reason_code": "INVALID_INPUT", "constraint": "input",
               "details": {}, "checks": 0, "elapsed_s": 0., "clearance_lower_bound_m": None,
+              "execution_robust": False,
               "assumptions": ["explicit convex verified corridor; observed-empty obstacles require caller evidence",
                   "constant tangential acceleration normalized within distance tolerance; scaled limits checked",
                   "shortest yaw by spatial progress; geometric curvature checked independently",
@@ -376,6 +423,11 @@ def validate_candidate(points, motion_direction, vehicle, limits, corridor, obst
                   "discrete bicycle/steering-rate limits; no actuator calibration or time-tracking guarantee",
                   "not public behavior feedback, live source validation, or permission to drive"]}
     try:
+        if execution_envelope is not None:
+            validate_execution_envelope(execution_envelope)
+            report['assumptions'].append('caller-supplied position/yaw/time error envelope; no inferred calibration')
+        if isinstance(corridor,CorridorRegion):
+            report['assumptions'][0]='explicit simple-polygon union; gaps/holes retained; caller supplies source/coverage authority'
         if not isinstance(budget, ValidationBudget):
             _invalid("explicit ValidationBudget required")
         if (type(budget.max_checks) is not int or budget.max_checks <= 0
@@ -415,16 +467,32 @@ def validate_candidate(points, motion_direction, vehicle, limits, corridor, obst
         planes = _corridor(corridor, checks)
         segments, horizon = _motion(points, motion_direction, vehicle, limits, checks)
         for obstacle in obstacles:
-            if horizon > obstacle.valid_until_s:
+            required_horizon = horizon + (execution_envelope.late_time_s if execution_envelope else 0.)
+            if required_horizon > obstacle.valid_until_s:
                 raise _Stop("inconclusive", "PREDICTION_HORIZON", "prediction_horizon",
-                            obstacle_id=obstacle.identity, required_horizon_s=horizon)
-        clearance = _sweep(segments, vehicle, planes, obstacles, checks)
+                            obstacle_id=obstacle.identity, required_horizon_s=required_horizon)
+        clearance = _sweep(segments, vehicle, planes, obstacles, checks, execution_envelope)
         checks.consume()  # A final expensive check must not finish past deadline unnoticed.
         report.update(status="safe", reason_code="CERTIFIED", constraint="nominal_model",
+                      execution_robust=execution_envelope is not None,
                       clearance_lower_bound_m=clearance,
                       details={"segment_count": len(segments), "validated_horizon_s": horizon})
+        if isinstance(corridor,CorridorRegion):
+            report['details'].update(region_count=len(planes.polygons),exterior_edge_count=planes.edge_count)
+            if hasattr(planes,'barrier_count'):
+                report['details']['source_perimeter_barrier_count']=planes.barrier_count
+                report['assumptions'].append('complete nominal source perimeter except explicitly source-bound shared openings')
+    except PreparationLimit as error:
+        report.update(status='inconclusive',reason_code='REGION_PREPARATION_LIMIT',
+                      constraint='region_topology',details={'message':str(error)})
+    except NumericResolution as error:
+        report.update(status='inconclusive',reason_code='REGION_NUMERIC_RESOLUTION',
+                      constraint='region_topology',details={'message':str(error)})
     except _Stop as stop:
         report.update(status=stop.status, reason_code=stop.code, constraint=stop.constraint, details=stop.details)
+        if (stop.code=='BUDGET_EXHAUSTED' and isinstance(corridor,CorridorRegion)
+                and corridor.preparation_max_checks is not None and corridor._prepared is None):
+            report['details'].update(preparation_complete=False,preparation_checks=corridor._job_steps)
     except (ValueError, TypeError, AttributeError, OverflowError, ZeroDivisionError) as exc:
         report.update(status="invalid", reason_code="INVALID_INPUT", constraint="input", details={"message": str(exc)})
     report["checks"] = checks.count if checks is not None else 0

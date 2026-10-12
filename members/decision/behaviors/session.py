@@ -55,10 +55,10 @@ class BehaviorSession(object):
     def _goal_key(goal):
         pose = None if goal.goal_pose is None else (goal.goal_pose.x, goal.goal_pose.y,
                                                    goal.goal_pose.body_heading_rad)
-        return (goal.target_lane_id, goal.parking_space_id, pose, goal.motion_direction,
+        return (goal.target_lane_id, goal.source_lane_id, goal.parking_space_id, pose, goal.motion_direction,
                 goal.precision_stop, goal.minimum_standstill_duration_s,
                 goal.parking_brake_at_stop, tuple(sorted(goal.light_intent.to_dict().items())),
-                goal.stop_obligation_id)
+                goal.stop_obligation_id, goal.candidate_id)
 
     def start(self, frame, key, maneuver, stage, goal, required=()):
         require(isinstance(frame, BehaviorFrame) and isinstance(goal, BehaviorGoal), "invalid intent start")
@@ -142,10 +142,12 @@ class BehaviorSession(object):
         if self.goal is not None:
             old = self.goal
             self.goal = BehaviorGoal(target_lane_id=old.target_lane_id, parking_space_id=old.parking_space_id,
+                source_lane_id=old.source_lane_id,
                 goal_pose=old.goal_pose, motion_direction=old.motion_direction, speed_cap_mps=0.0,
                 stop_distance_m=old.stop_distance_m, precision_stop=old.precision_stop,
                 minimum_standstill_duration_s=old.minimum_standstill_duration_s,
                 parking_brake_at_stop=old.parking_brake_at_stop, stop_obligation_id=old.stop_obligation_id,
+                candidate_id=old.candidate_id,
                 light_intent=LightIntent(hazard_signal=old.light_intent.hazard_signal))
         self.status, self.reason_code, self._dispatched = "BLOCKED", reason, False
         self._event(frame, reason)

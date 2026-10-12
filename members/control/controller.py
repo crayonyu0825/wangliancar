@@ -142,6 +142,8 @@ class ControlEngine(object):
                 raise ValueError("invalid GPS gear position")
             validate_output(trajectory, Trajectory, perception)
             if case_changed:
+                if self.case is not None and self.standstill.active:
+                    raise ValueError('unfinished standstill requires an explicit captain reset for a new task')
                 # Invalid packets with a changed task/case label cannot erase
                 # an already accepted minimum standstill obligation.
                 self.reset()
@@ -179,7 +181,17 @@ class ControlEngine(object):
                 self.integral = 0.0
                 self.release_frames = 0
                 self.state = "EMERGENCY"
-                self.direction.disarm()
+                # Immediate braking must not erase a previously established
+                # direction while the car is still moving in that direction.
+                # The following authorized avoidance can then steer and brake;
+                # a new/opposite direction still needs measured standstill.
+                same_motion=(self.direction.last_direction==direction
+                    and self.direction.pending_direction is None
+                    and all(_finite(getattr(ego,n,None)) for n in ('vx','vy'))
+                    and not opposes_direction(ego.vx,ego.vy,ego.heading,ego.speed,direction,
+                                             self.settings.gear_standstill_speed_mps))
+                if not same_motion:
+                    self.direction.disarm()
                 self.standstill.interrupt()
                 self._forget_projection()
                 output.diagnostics["state"] = self.state
@@ -200,6 +212,7 @@ class ControlEngine(object):
                     ((direction == -1 or self.direction.pending_direction is not None) and
                      abs(vector_speed - ego.speed) > self.settings.gear_standstill_speed_mps)):
                 raise ValueError("reverse or invalid velocity magnitude disagrees with ego speed")
+            self.standstill.request(trajectory)
             if self.standstill.update(ego, dt, self.settings):
                 return self._braking_output(output, ego, "DWELL", 0,
                                             self.standstill.parking_brake)

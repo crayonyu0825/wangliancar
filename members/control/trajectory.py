@@ -39,6 +39,16 @@ class PreparedPath(object):
             raise ValueError("path has no forward geometry")
         self.curvatures = [self.curvature_at(s, curve_window_m)
                            for s in self.arc]
+        # Only the initial nondecreasing speed prefix may be previewed for
+        # propulsion. An internal stop or an earlier slowdown ends this
+        # prefix permanently, even if the speed rises again farther ahead.
+        self.launch_prefix_end = 0.0
+        previous_speed = self.points[0][2]
+        for point_s, point in zip(self.arc[1:], self.points[1:]):
+            if point[2] <= 1e-6 or point[2] < previous_speed:
+                break
+            self.launch_prefix_end = point_s
+            previous_speed = point[2]
 
     @property
     def length(self):
@@ -146,35 +156,12 @@ class PreparedPath(object):
         """Point speed with future slowdowns and known path end as upper bounds."""
         local = self.sample(s)[2]
         rising_preview_end = s
-        # A rolling profile starts at measured speed, not at cruise speed.
-        # Preview the rising first segment throughout acceleration, otherwise
-        # PI sees zero error on every replan and never reaches cruise speed.
-        # An interior zero-speed constraint is never bypassed this way.
-        if s <= 1e-6 and trajectory.target_speed > 0:
-            preview_s = min(self.length, s + settings.launch_preview_m)
-            if (trajectory.stop_required and self.points[-1][2] <= 1e-6
-                    and preview_s >= self.length):
-                # A short replanned accelerate-then-stop profile has a zero
-                # endpoint. Sample its interior so a stationary car can creep
-                # to the actual boundary, respecting every subsequent cap.
-                preview_s = self.length * 0.5
-            previous_s, previous = s, local
-            for point_s, point in zip(self.arc, self.points):
-                if point_s <= s:
-                    continue
-                if point_s > preview_s:
-                    break
-                if point[2] <= 1e-6 or point[2] < previous:
-                    preview_s = previous_s
-                    break
-                previous_s, previous = point_s, point[2]
+        # Replanned paths start at measured speed; retained maneuver paths
+        # keep their original zero-speed start. Continue bounded preview after
+        # the first tiny movement so neither form becomes trapped in HOLD.
+        if s < self.launch_prefix_end and trajectory.target_speed > 0:
+            preview_s = min(self.launch_prefix_end, s + settings.launch_preview_m)
             preview_speed = self.sample(preview_s)[2]
-            if preview_speed < previous:
-                # A short accelerate-then-stop profile can peak before its
-                # geometric midpoint (for example at a retained map vertex).
-                # Preview only its rising prefix; keep the falling portion
-                # and the zero endpoint as independent braking constraints.
-                preview_s, preview_speed = previous_s, previous
             launch_limit = math.sqrt(local * local +
                                      2.0 * settings.launch_accel_mps2 *
                                      max(0.0, preview_s - s))

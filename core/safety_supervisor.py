@@ -15,6 +15,7 @@ from core.traffic_quality import signal_stop_requirement, signal_stop_bound
 from core.validation import current, number
 from core.target_semantics import mapped_traffic_light
 from core.route_obstacles import RouteContext, mapped_route_motion, route_footprint_relevant
+from core.geometry import opposes_direction
 
 
 class SafetyAssessment(object):
@@ -35,8 +36,16 @@ class SafetySupervisor(object):
     SimOne may reject repeated headers; the sender must report its receipt.
     """
 
-    def __init__(self, config, clock=None, planning_settings=None, decision_settings=None):
+    def __init__(self, config, clock=None, planning_settings=None, decision_settings=None,parking_guard=None,
+                 lane_change_guard=None, driving_guard=None, execution_guard=None):
         self.clock = clock or time.monotonic
+        if parking_guard is not None and not callable(parking_guard):
+            raise ValueError('invalid parking safety guard')
+        self.parking_guard=parking_guard
+        if any(v is not None and not callable(v) for v in (lane_change_guard, driving_guard, execution_guard)):
+            raise ValueError('invalid maneuver safety guard')
+        self.lane_change_guard, self.driving_guard = lane_change_guard, driving_guard
+        self.execution_guard=execution_guard
         self.repeat_fault_ms = max(1, int(getattr(config, "pipeline_timeout_ms", 200)))
         self.last_gps_ms = max(1, int(getattr(config, "sensor_timeout_ms", 500)))
         self.recovery_frames = max(1, int(getattr(config, "safety_recovery_frames", 3)))
@@ -222,13 +231,31 @@ class SafetySupervisor(object):
             self.last_good_at = now
 
         signal_fault = self._signal_guard(perception, decision, trajectory) if gps_ok else ''
+        parking = self._parking_assessment(perception,decision,trajectory,control) if gps_ok else None
+        maneuver = self._maneuver_assessment(perception,decision,trajectory,control) if gps_ok else None
+        execution=None
+        if gps_ok and self.execution_guard is not None:
+            try:
+                execution=self.execution_guard(perception,trajectory)
+                if not isinstance(execution,SafetyAssessment):
+                    raise ValueError('invalid execution assessment')
+            except Exception as error:
+                execution=SafetyAssessment('fault_stop','execution_monitor_failed:'+str(error))
+        verified_motion = ((parking is not None and not parking.active)
+                           or (maneuver is not None and not maneuver.active))
         mode, reason = "normal", ""
         if not gps_ok:
             mode, reason = "fault_stop", "gps_invalid_or_expired"
         elif (getattr(perception.ego, "age_ms", -1) >= self.repeat_fault_ms
               or repeat_ms >= self.repeat_fault_ms):
             mode, reason = "fault_stop", "gps_frame_stalled"
-        elif self._imminent_collision(perception, self.collision_settings, self.route_settings):
+        elif parking is not None and parking.active:
+            mode,reason=parking.mode,parking.reason
+        elif execution is not None and execution.active:
+            mode,reason=execution.mode,execution.reason
+        elif maneuver is not None and maneuver.active:
+            mode,reason=maneuver.mode,maneuver.reason
+        elif not verified_motion and self._imminent_collision(perception, self.collision_settings, self.route_settings):
             mode, reason = "emergency_stop", "imminent_target_collision"
         elif not getattr(perception, "lane", None) or not perception.lane.valid:
             mode, reason = "controlled_stop", "lane_unavailable"
@@ -242,11 +269,18 @@ class SafetySupervisor(object):
         elif signal_fault:
             mode, reason = 'controlled_stop', signal_fault
         elif (current(decision, perception)
-              and decision.mode == DecisionMode.EMERGENCY_BRAKE):
+              and decision.mode == DecisionMode.EMERGENCY_BRAKE
+              and not (maneuver is not None and not maneuver.active
+                       and isinstance(getattr(decision,'behavior_request',None),dict)
+                       and decision.behavior_request.get('maneuver')=='EMERGENCY'
+                       and control is not None and control.throttle==0 and control.brake>0)):
             mode, reason = "emergency_stop", "collision_or_emergency_request"
         elif not current(trajectory, decision):
             mode, reason = "fault_stop", "trajectory_invalid_or_expired"
-        elif trajectory.emergency_stop:
+        elif (trajectory.emergency_stop and not (maneuver is not None and not maneuver.active
+              and isinstance(getattr(decision,'behavior_request',None),dict)
+              and decision.behavior_request.get('maneuver')=='EMERGENCY'
+              and control is not None and control.valid and control.throttle==0 and control.brake>0)):
             mode, reason = "emergency_stop", "trajectory_emergency_request"
         elif (self.normal_control_required and new_frame and control is not None
               and not current(control, trajectory)):
@@ -264,7 +298,62 @@ class SafetySupervisor(object):
                 self.recovering, self.good_frames = False, 0
         control = self._candidate(mode, reason, now,
                                   perception.valid_until if gps_ok else None)
+        request=getattr(decision,'behavior_request',None)
+        if (control is not None and mode!='normal' and isinstance(request,dict)
+                and request.get('maneuver')=='EMERGENCY'):
+            control.hazard_signal=True
         return SafetyAssessment(mode, reason, control)
+
+    def _maneuver_assessment(self,p,decision,trajectory,control):
+        request=getattr(decision,'behavior_request',None)
+        if not isinstance(request,dict) or request.get('maneuver')=='SIGNAL_STOP':
+            if self.driving_guard is not None:
+                try:
+                    result=self.driving_guard(p,decision,trajectory,control)
+                    if not isinstance(result,SafetyAssessment):raise ValueError('invalid ordinary guard')
+                    return result
+                except Exception as error:
+                    return SafetyAssessment('fault_stop','ordinary_monitor_failed:'+str(error))
+            return None
+        action=request.get('maneuver')
+        if action in ('LANE_CHANGE','OVERTAKE','AVOID','MERGE'):
+            guard=self.lane_change_guard
+        elif action in ('INTERSECTION','CROSSWALK','JUNCTION_ENTRY','EMERGENCY'):
+            guard=self.driving_guard
+        else:
+            return None
+        if guard is None:
+            return SafetyAssessment('controlled_stop','maneuver_monitor_unavailable')
+        try:
+            result=guard(p,decision,trajectory,control)
+            if not isinstance(result,SafetyAssessment) or result.mode not in (
+                    'normal','controlled_stop','fault_stop','emergency_stop'):
+                raise ValueError('invalid maneuver guard assessment')
+            return result
+        except Exception as error:
+            return SafetyAssessment('fault_stop','maneuver_monitor_failed:'+str(error))
+
+    def _parking_assessment(self,p,decision,trajectory,control):
+        request=getattr(decision,'behavior_request',None)
+        parking=isinstance(request,dict) and request.get('maneuver')=='PARK'
+        if parking:
+            if self.parking_guard is None:
+                return SafetyAssessment('controlled_stop','parking_monitor_unavailable')
+            try:
+                result=self.parking_guard(p,decision,trajectory,control)
+                if not isinstance(result,SafetyAssessment) or result.mode not in (
+                        'normal','controlled_stop','fault_stop','emergency_stop'):
+                    raise ValueError('invalid parking guard assessment')
+                return result
+            except Exception as error:
+                return SafetyAssessment('fault_stop','parking_monitor_failed:'+str(error))
+        if getattr(trajectory,'motion_direction',1)!=1:
+            return SafetyAssessment('fault_stop','reverse_maneuver_unverified')
+        if not all(number(v) for v in (p.ego.vx,p.ego.vy,p.ego.heading,p.ego.speed)):
+            return SafetyAssessment('fault_stop','actual_velocity_unavailable')
+        if opposes_direction(p.ego.vx,p.ego.vy,p.ego.heading,p.ego.speed):
+            return SafetyAssessment('emergency_stop','actual_motion_opposes_forward_path')
+        return None
 
     def _candidate(self, mode, reason, now, source_deadline):
         if mode == "normal" or self.last_good_header is None:

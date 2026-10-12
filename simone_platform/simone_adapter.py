@@ -1,4 +1,4 @@
-"""The only module in this project allowed to call the official SimOne API."""
+"""Captain-owned gateway to official SimOne APIs and ABI-isolated helpers."""
 
 import importlib
 import copy
@@ -16,6 +16,7 @@ from simone_platform.sdk_compat import polling_structs
 from simone_platform.sensor_catalog import (TARGET_INGESTION_VERSION, sensor_kind,
                                            target_sensor_ids)
 from simone_platform.map_observations import MapObservationReader, vector_items
+from simone_platform.map_document import MapDocument
 
 
 def _decode_sdk_text(value):
@@ -95,6 +96,7 @@ class SimOneAdapter(object):
                                     "environment": {}, "environment_valid": False}
         self._reference_update = 0.0
         self._map_observations = None
+        self._map_document = MapDocument()
         self._traffic_candidates = {}
         self._last_frame_times = {}
         self.sdk_version = ""
@@ -163,6 +165,8 @@ class SimOneAdapter(object):
     def load_hdmap(self):
         if self.hdmap is None:
             raise RuntimeError("SDK 尚未加载")
+        selected = MapDocument.selected_identity(self.service_api,self.structs,self.sdk_version)
+        self._map_document.clear("MAP_NOT_LOADED")
         self.map_loaded = bool(self.hdmap.loadHDMap(int(self.config.map_timeout_sec)))
         self._traffic_candidates = {}
         self._map_observations = None
@@ -171,7 +175,29 @@ class SimOneAdapter(object):
             self.logger.warning("高精地图加载失败；GPS/目标数据仍可继续输出")
         else:
             self.logger.info("高精地图加载成功")
+            if selected is not None:
+                metadata = self._map_document.load(self.service_api,self.structs,self.sdk_version,
+                    self.config.sdk_dir,getattr(self.config,"map_document_file",""),
+                    loaded_identity=selected)
+                self.logger.info("地图语义文档 verified=%s source=%s reason=%s",
+                    metadata["verified"],metadata["source"],metadata["reason"])
+            else:
+                self._map_document.clear("MAP_IDENTITY_API_OR_ABI_UNVERIFIED")
         return self.map_loaded
+
+    def read_map_document(self):
+        """Private captain input: exact document bytes plus current identity.
+
+        This performs no download or HDMap reload in the driving loop. An
+        identity change requires load_hdmap(), so old SDK geometry cannot be
+        paired with the newly selected XML. No document/URL enters telemetry.
+        """
+        if not self.map_loaded:
+            self._map_document.clear("MAP_NOT_LOADED")
+        elif self._map_document.data is not None:
+            self._map_document.verified(self.service_api,self.structs,self.sdk_version)
+        metadata = self._map_document.metadata()
+        return (self._map_document.data if metadata["verified"] else None),metadata
 
     def get_case_status(self):
         return int(self.service_api.SoGetCaseRunStatus())

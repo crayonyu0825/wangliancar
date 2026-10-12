@@ -29,8 +29,12 @@ def _link_frame(perception, output):
 
 
 class DecisionEngine(object):
-    def __init__(self, settings=None, clock=None):
+    def __init__(self, settings=None, clock=None,parking_inputs_provider=None,lane_change_inputs_provider=None,
+                 driving_inputs_provider=None):
         self._clock = clock or time.monotonic
+        self._parking_inputs_provider=parking_inputs_provider
+        self._lane_change_inputs_provider=lane_change_inputs_provider
+        self._driving_inputs_provider=driving_inputs_provider
         self.settings = (settings if settings is not None
                          else DecisionSettings.from_environment()).validate()
         self.reset()
@@ -40,7 +44,8 @@ class DecisionEngine(object):
         if hasattr(self, "_behavior"):
             self._behavior.reset()
         else:
-            self._behavior = BehaviorCoordinator(self.settings)
+            self._behavior = BehaviorCoordinator(self.settings, self._clock,self._parking_inputs_provider,
+                                                 self._lane_change_inputs_provider,self._driving_inputs_provider)
         self._last_constraints = None
         self._blind_fault_count = 0
         self._blind_stop = False
@@ -72,7 +77,7 @@ class DecisionEngine(object):
         trusted = protocol.perception_usable(perception)
         if self._context is None:
             self._context = context
-        if (context != self._context or rolled_back) and trusted:
+        if (context != self._context or rolled_back) and trusted and not self._behavior.execution_pending():
             self.reset()
             self._context = context
         distinct = self._last_frame is None or frame_id != self._last_frame[0]
@@ -86,12 +91,29 @@ class DecisionEngine(object):
             _link_frame(perception, output)
             distinct = self._observe_frame(perception)
             self._last_constraints = None
-            self._arbitrate(perception, output, distinct)
+            if protocol.perception_usable(perception) and self._behavior.parking.prepare(perception,self._clock()):
+                self._behavior.parking.provisional(perception,output)
+            else:
+                if not protocol.perception_usable(perception): self._behavior.parking.suspend()
+                self._arbitrate(perception, output, distinct)
             if output.valid and protocol.perception_usable(perception):
                 try:
                     self._behavior.observe_legacy(perception, output, self._last_constraints, self._clock())
+                    self._behavior.apply_driving(perception,output)
+                    self._behavior.apply_lane_change(perception,output,self._last_constraints)
+                    self._behavior.apply_parking(perception,output)
                 except (ValueError, TypeError, AttributeError, KeyError) as exc:
                     self._behavior.diagnostic_error(output.frame_id, type(exc).__name__)
+                    if self._behavior.execution_pending() or self._behavior.parking.claimed:
+                        self._behavior.parking.suspend()
+                        self._behavior.lane_changes.suspend()
+                        self._behavior.driving.suspend()
+                        output.behavior_request,output.behavior_active_identity = None,None
+                        self._protect(output,perception.ego.speed,"BEHAVIOR_CHANNEL_FAILURE:"+type(exc).__name__)
+            elif self._behavior.parking.claimed:
+                self._behavior.parking.suspend()
+                if output.mode not in (DecisionMode.STOP,DecisionMode.EMERGENCY_BRAKE):
+                    self._behavior.parking.hold(perception,output)
         except Exception as exc:
             output.valid = False
             output.mode = DecisionMode.STOP
@@ -160,7 +182,7 @@ class DecisionEngine(object):
                                    signal_id, distance), distance=distance,
                                valid_until=perception.valid_until)
         saw_target_conflict = False
-        hazard_ids, confirmed_clear_ids = set(), set()
+        hazard_ids, confirmed_clear_ids, observed_clear_ids = set(), set(), set()
         result.obstacle_clearance_m = settings.obstacle_stop_margin
         seen_ids = set()
         for target in perception.targets if protocol.targets_usable(perception) else []:
@@ -168,6 +190,12 @@ class DecisionEngine(object):
                                               perception, route, settings)
             self._history.observe(perception, item)
             if not item.conflict:
+                identifier=getattr(target,'id',-1)
+                track=self._history.tracks.get(identifier)
+                if (distinct and not item.reason and track is not None
+                        and track.quality=='CONTINUOUS' and len(track.samples)>=2
+                        and track.samples[-1].frame_id==perception.frame_id):
+                    observed_clear_ids.add(identifier)
                 continue
             identifier = getattr(target, "id", -1)
             if self._history.discontinuous(identifier):
@@ -295,6 +323,13 @@ class DecisionEngine(object):
             # its own fresh-frame gate. A different safe lead is not evidence
             # that a disappeared hazard is clear.
             if self._target_hazard_ids and self._target_hazard_ids <= confirmed_clear_ids:
+                self._target_clear_count = settings.release_frames
+            elif (self._target_hazard_ids=={self._behavior.lane_changes.lead_id}
+                  and self._target_hazard_ids<=observed_clear_ids
+                  and self._behavior.lane_changes.observed_avoidance_handoff(perception)):
+                # The same observed hazard now lies outside the authorized
+                # target route. This retires the legacy clear-confirmation
+                # latch only; P02/P05 keep checking that actual object's body.
                 self._target_clear_count = settings.release_frames
             elif distinct:
                 self._target_clear_count += 1

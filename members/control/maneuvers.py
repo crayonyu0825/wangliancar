@@ -61,6 +61,15 @@ class StandstillGuard(object):
         self.anchor = None
         self.direction = 1
         self.parking_brake = False
+        self.obligation_id = ""
+
+    def request(self, trajectory):
+        identifier = trajectory.stop_obligation_id
+        if self.active:
+            if identifier and self.obligation_id and identifier!=self.obligation_id:
+                raise ValueError("unfinished standstill obligation changed")
+            if identifier==self.obligation_id:
+                self.duration = max(self.duration,trajectory.hold_duration_s)
 
     @property
     def active(self):
@@ -77,12 +86,14 @@ class StandstillGuard(object):
         # An unchanged completed stop must not start a new ten-second dwell
         # every frame. A genuinely different stop can request a new dwell.
         if (self.anchor is not None and self.elapsed >= self.duration and
+                trajectory.stop_obligation_id==self.obligation_id and
                 math.hypot(ego.x - self.anchor[0], ego.y - self.anchor[1]) < 0.3):
             return
         self.duration, self.elapsed = duration, 0.0
         self.anchor = (ego.x, ego.y, ego.heading)
         self.direction = getattr(trajectory, "motion_direction", 1)
         self.parking_brake = getattr(trajectory, "parking_brake_at_stop", False)
+        self.obligation_id = trajectory.stop_obligation_id
 
     def update(self, ego, dt, settings):
         if not self.active:

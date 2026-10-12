@@ -28,7 +28,7 @@ if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
 from core.interfaces import (  # noqa: E402  (path setup must run first)
-    EgoState, LaneContext, Perception, Target, TrafficControl)
+    EgoState, LaneContext, Perception, Target, TrafficControl, ManeuverEnvironment)
 from members.decision.engine import DecisionEngine  # noqa: E402
 from members.decision.settings import FIELDS, DecisionSettings  # noqa: E402
 
@@ -43,6 +43,7 @@ NESTED = {
     "lane": LaneContext,
     "traffic": TrafficControl,
     "targets": Target,
+    "maneuver_environment": ManeuverEnvironment,
 }
 
 

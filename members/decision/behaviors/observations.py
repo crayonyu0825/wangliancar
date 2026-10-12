@@ -4,84 +4,11 @@ import math
 from members.decision.behaviors.contract import TaskContext, GoalPose, finite, require
 
 
-class Evidence(object):
-    def __init__(self, context, frame_id, observed_at_s, valid_until_s, usable=False,
-                 coverage_verified=False, source="unknown", clock_id="process_monotonic",
-                 source_kind="unknown"):
-        require(isinstance(context, TaskContext) and type(frame_id) is int and frame_id >= 0,
-                "invalid observation identity")
-        require(finite(observed_at_s) and finite(valid_until_s) and type(usable) is bool
-                and type(coverage_verified) is bool and isinstance(source, str), "invalid observation evidence")
-        self.context, self.frame_id, self.observed_at_s, self.valid_until_s = context, frame_id, observed_at_s, valid_until_s
-        require(source_kind in ("unknown", "sensor", "map", "task", "planning", "verified_fusion",
-                                "synthetic", "diagnostic_ground_truth"), "invalid observation source kind")
-        self.usable, self.coverage_verified, self.source, self.clock_id = usable, coverage_verified, source, clock_id
-        self.source_kind = source_kind
-
-    def verified(self, frame, max_age_s=0.5,
-                 allowed_source_kinds=("sensor", "map", "task", "planning", "verified_fusion", "synthetic")):
-        return (self.source_kind in allowed_source_kinds and self.usable and self.coverage_verified and self.source != "unknown"
-                and self.context.key() == frame.context.key() and self.clock_id == frame.clock_id
-                and self.frame_id <= frame.frame_id
-                and self.observed_at_s <= frame.observed_at_s < self.valid_until_s
-                and frame.observed_at_s - self.observed_at_s <= max_age_s
-                and frame.current(frame.observed_at_s) and not frame.paused)
+from core.behavior_evidence import Evidence
 
 
-def polygon(raw):
-    require(isinstance(raw, (tuple, list)) and 3 <= len(raw) <= 128, "polygon coverage missing")
-    points = []
-    for item in raw:
-        require(isinstance(item, (tuple, list)) and len(item) == 2
-                and all(finite(v) for v in item), "invalid polygon coordinate")
-        points.append((float(item[0]), float(item[1])))
-    area = sum(a[0] * b[1] - a[1] * b[0] for a, b in zip(points, points[1:] + points[:1]))
-    require(abs(area) > 1e-8, "degenerate polygon")
-    signs = []
-    for i in range(len(points)):
-        a, b, c = points[i - 1], points[i], points[(i + 1) % len(points)]
-        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
-        if abs(cross) > 1e-8:
-            signs.append(cross > 0)
-    require(bool(signs) and all(s == signs[0] for s in signs), "nonconvex or ambiguous polygon")
-    return points
-
-
-def inside(point, region):
-    signs = []
-    for a, b in zip(region, region[1:] + region[:1]):
-        cross = (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
-        if abs(cross) > 1e-8:
-            signs.append(cross > 0)
-    return not signs or all(s == signs[0] for s in signs)
-
-
-def intersects(left, right):
-    for shape in (left, right):
-        for a, b in zip(shape, shape[1:] + shape[:1]):
-            nx, ny = -(b[1] - a[1]), b[0] - a[0]
-            l = [nx * p[0] + ny * p[1] for p in left]
-            r = [nx * p[0] + ny * p[1] for p in right]
-            if max(l) < min(r) - 1e-8 or max(r) < min(l) - 1e-8:
-                return False
-    return True
-
-
-def hull(points):
-    ordered = sorted(set(points))
-    require(len(ordered) >= 3, "insufficient swept footprint")
-    def cross(a, b, c):
-        return (b[0]-a[0]) * (c[1]-a[1]) - (b[1]-a[1]) * (c[0]-a[0])
-    lower, upper = [], []
-    for p in ordered:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-    for p in reversed(ordered):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-    return lower[:-1] + upper[:-1]
+# Shared geometry preserves the existing decision entry points.
+from core.region_geometry import convex_polygon as polygon, inside, intersects, hull
 
 
 def vehicle_footprint(pose, front, rear, half_width):
@@ -138,13 +65,20 @@ def corridor_contains(body, left_boundary, right_boundary):
 class MotionObject(object):
     def __init__(self, identifier, x, y, vx, vy, length, width, heading=0.0):
         require(type(identifier) is int and identifier >= 0
-                and all(finite(v) for v in (x, y, vx, vy, length, width, heading))
+                and all(finite(v) for v in (x, y, vx, vy, length, width))
+                and (heading is None or finite(heading))
                 and min(length, width) > 0, "invalid motion object")
         self.identifier, self.x, self.y, self.vx, self.vy = identifier, x, y, vx, vy
         self.length, self.width, self.heading = length, width, heading
 
     def footprint(self, time_s=0.0, margin=0.0):
         require(finite(time_s) and time_s >= 0 and finite(margin) and margin >= 0, "invalid prediction range")
+        if self.heading is None:
+            # An axis-aligned square encloses the bounding circle for every
+            # possible body orientation; zero is its envelope orientation.
+            radius = .5 * math.hypot(self.length, self.width) + margin
+            return vehicle_footprint(GoalPose(self.x+self.vx*time_s, self.y+self.vy*time_s, 0.),
+                                     radius, radius, radius)
         return vehicle_footprint(GoalPose(self.x+self.vx*time_s, self.y+self.vy*time_s, self.heading),
                                  self.length/2+margin, self.length/2+margin, self.width/2+margin)
 
