@@ -29,6 +29,7 @@ class BehaviorSession(object):
         self.status, self.reason_code = "IDLE", "NO_INTENT"
         self.attempt, self._elapsed, self._no_progress = 0, 0.0, 0.0
         self._total_retries = 0
+        self._renewal_keys=set()
         self._last_frame, self._last_time, self._progress = None, None, 0.0
         self._hold_progress = 0.0
         self._actual_progress_m = 0.0
@@ -163,6 +164,22 @@ class BehaviorSession(object):
         self._revise(frame, reason)
         return True
 
+    def renew_after_verified_change(self, frame, evidence_key, limit=2):
+        """A bounded new attempt budget after a distinct verified fact change.
+
+        Time passing and repeated PLANNED replies are not evidence keys. The
+        caller owns the observable change (for example occupied -> covered
+        clear). This preserves the intent, stage and accepted obligations.
+        """
+        keys=getattr(self,'_renewal_keys',set())
+        if (self.status!='BLOCKED' or not isinstance(evidence_key,str) or not evidence_key
+                or evidence_key in keys or len(keys)>=limit
+                or not frame.current(frame.observed_at_s) or frame.paused
+                or self.context.key()!=frame.context.key()):return False
+        keys.add(evidence_key);self._renewal_keys=keys;self._total_retries=0
+        self._revise(frame,'VERIFIED_FACT_CHANGED_REVALIDATE')
+        return True
+
     def _revise(self, frame, reason):
         self.revision += 1
         self.source_frame_id = frame.frame_id
@@ -253,6 +270,10 @@ class BehaviorSession(object):
                 elif feedback.status == "FAILED":
                     return self.block(frame, feedback.reason_code or "EXECUTION_FAILED")
                 else:
+                    if (self.maneuver=='BLOCKED_ROAD' and feedback.producer in ('control','runtime')
+                            and feedback.actual_standstill_confirmed
+                            and (feedback.goal_pose_arrived or 0<=self.goal.stop_distance_m<=1.0)):
+                        self._no_progress=0.0
                     if feedback.progress > self._progress:
                         self._progress = feedback.progress
                         self._no_progress = 0.0

@@ -31,7 +31,7 @@ def capabilities(perception, settings):
     if not perception.session_id or perception.valid is not True or perception.ego.valid is not True or not geometry(settings):
         return None
     f = behavior_frame(perception, time.monotonic())
-    result = Capabilities(f.context, ("LANE_CHANGE", "PATH", "LIGHTS", "FEEDBACK"),
+    result = Capabilities(f.context, ("LANE_CHANGE", "PATH", "LIGHTS", "FEEDBACK", "PARK", "REVERSE", "DWELL", "PATH_STOP", "INTERSECTION", "EMERGENCY_CANDIDATES", "TASK_ROUTE"),
                           f.observed_at_s, f.valid_until_s, usable=f.usable)
     return result
 
@@ -107,7 +107,14 @@ class BehaviorPlanner(object):
             blend = 10*u**3-15*u**4+6*u**5
             other_point=at(target.center_line,target_arc,other['s'])
             delta = -(other_point[0]-x)*math.sin(heading)+(other_point[1]-y)*math.cos(heading)
-            lateral = offset*(1-blend)+delta*blend
+            # Match the actual initial tangent as well as position. This is
+            # necessary when rejoining after a stopped emergency turn.
+            tangent_length=min(8.0,length)
+            v=min(1.0,distance/tangent_length)
+            tangent_basis=v-6*v**3+8*v**4-3*v**5
+            angle=normalize_angle(p.ego.heading-base[2])
+            if abs(angle)>0.4:raise ValueError('initial heading incompatible with lane transition')
+            lateral = offset*(1-blend)+delta*blend+tangent_length*math.tan(angle)*tangent_basis
             raw.append((x-math.sin(heading)*lateral, y+math.cos(heading)*lateral))
         raw[0] = (p.ego.x, p.ego.y)
         return raw,start_s+length

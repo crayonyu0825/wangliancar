@@ -44,6 +44,7 @@ class ControlEngine(object):
     def reset(self):
         self._execution_progress = {}
         self.case = None
+        self.execution_session = None
         self.last_frame = None
         self.last_time = None
         self.last_output = None
@@ -128,7 +129,8 @@ class ControlEngine(object):
                    <= self.settings.precision_heading_tolerance_rad)
         stopped = ego.speed <= self.settings.gear_standstill_speed_mps
         hold_complete = (arrived and stopped and self.standstill.anchor is not None
-                         and self.standstill.elapsed >= request.goal.minimum_standstill_duration_s)
+                         and self.standstill.elapsed >= request.goal.minimum_standstill_duration_s
+                         and (request.goal.stop_obligation_id is None or self.standstill.obligation_id==request.goal.stop_obligation_id))
         if not hasattr(self, "_execution_progress"):
             self._execution_progress = {}
         identity = (frame.context.key(), request.intent_id, request.stage, request.revision)
@@ -187,11 +189,15 @@ class ControlEngine(object):
             if type(ego.gear) is not int:
                 raise ValueError("invalid GPS gear position")
             validate_output(trajectory, Trajectory, perception)
+            if (case_changed and self.standstill.active and perception.session_id
+                    and perception.session_id==self.execution_session):
+                return self._invalid(output,'task label changed without execution session reset')
             if case_changed:
                 # Invalid packets with a changed task/case label cannot erase
                 # an already accepted minimum standstill obligation.
                 self.reset()
                 self.case = case
+                self.execution_session=perception.session_id
             elif frame_rollback:
                 # Reject a trusted discontinuity and re-arm from subsequent
                 # fresh frames, without waiting for the old high-water mark.
@@ -232,6 +238,22 @@ class ControlEngine(object):
                 if self.calibration is None:
                     return self._invalid(output, "vehicle calibration required")
                 output.brake = self.calibration.emergency_brake
+                # A selected turn/brake path retains the identical emergency
+                # pedal output. Ordinary emergency packets still steer zero.
+                if trajectory.emergency_maneuver_authorized and ego.speed>0.05:
+                    from core.behavior_protocol import behavior_frame,validate_runtime_request
+                    validate_runtime_request(trajectory.behavior_request,behavior_frame(perception,now))
+                    geometry=perception.behavior_capabilities.vehicle_geometry
+                    if (not math.isclose(geometry['wheelbase_m'],self.calibration.wheelbase_m)
+                            or not math.isclose(geometry['front_steer_max_rad'],self.calibration.front_steer_max_rad)):
+                        raise ValueError('emergency steering calibration mismatch')
+                    path=PreparedPath(trajectory.points,self.settings.max_segment_m,self.settings.curve_window_m)
+                    progress,_,_=path.project(ego.x,ego.y,ego.heading,self.settings)
+                    curvature,details=geometry_request(path,progress,ego,self.settings,1,False)
+                    steering,_=steering_request(curvature,self.calibration)
+                    previous=self.last_output.steering if self.last_output else 0.0
+                    output.steering=_approach(previous,steering,self.settings.steering_slew_per_s*dt)
+                    output.diagnostics.update(details)
                 output.source = "control:EMERGENCY"
                 output.valid = True
                 output.clamp()

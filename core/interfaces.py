@@ -282,6 +282,7 @@ class Trajectory(FrameOutput):
         self.goal_pose = None
         self.target_speed = 0.0
         self.emergency_stop = False
+        self.emergency_maneuver_authorized = False
         self.stop_required = False
         self.stop_distance = -1.0
         self.target_lane_id = ""

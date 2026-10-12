@@ -246,7 +246,8 @@ class CaptainRuntime(object):
                     self._warned_no_control = True
                 else:
                     receipt["reason"] = "pipeline_invalid"
-            self.behavior_exchange.finish(perception, trajectory, control, receipt, safety.active)
+            executed_control=safety.control if safety.active and safety.control is not None else control
+            self.behavior_exchange.finish(perception, trajectory, executed_control, receipt, safety.active)
             # Flush after sending control, so file I/O cannot expire its frame.
             self._flush_evaluation()
             if self.config.publish_json:

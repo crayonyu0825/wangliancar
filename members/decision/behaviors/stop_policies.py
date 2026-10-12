@@ -52,10 +52,9 @@ class SignalDwellPolicy(object):
             self.reset()
             self._context = frame.context.key()
         if self._last_frame is not None and frame.frame_id < self._last_frame:
-            old = self.session.finish(frame, False, "GPS_FRAME_ROLLBACK") if self.session.intent_id else None
-            self.reset()
-            self._context, self._last_frame = frame.context.key(), frame.frame_id
-            return PolicyResult(old, True, "GPS_FRAME_ROLLBACK", "RECOVER")
+            self._last_frame=frame.frame_id
+            old=self.session.tick(frame,capabilities,safety_override=True) if self.session.intent_id else None
+            return PolicyResult(old,True,'GPS_FRAME_ROLLBACK_REVALIDATE','RECOVER')
         self._last_frame = frame.frame_id
         if not dwell_required:
             if self.session.intent_id is not None and self.session.status not in ("COMPLETED", "CANCELLED"):

@@ -300,12 +300,12 @@ class CandidateReference(object):
 
 class RuntimeRequest(BehaviorRequest):
     __slots__ = ("protocol_version", "authorization", "candidate_reference", "origin_lane_id",
-                 "constraint_ids", "target_id", "goal_region", "follow_clearance_m", "static_clearance_m")
+                 "constraint_ids", "target_id", "goal_region", "follow_clearance_m", "static_clearance_m", "segment_index")
 
     def __init__(self, frame, intent_id, maneuver, stage, revision, source_frame_id,
                  goal, authorization="EVALUATE_ONLY", candidate_reference=None,
                  origin_lane_id="", constraint_ids=(), target_id=None, goal_region=None,
-                 issued_at_s=None, follow_clearance_m=10.5, static_clearance_m=0.5):
+                 issued_at_s=None, follow_clearance_m=10.5, static_clearance_m=0.5, segment_index=None):
         require(finite(follow_clearance_m) and follow_clearance_m >= 0
                 and finite(static_clearance_m) and static_clearance_m >= 0,"invalid behavior clearance")
         require(authorization in ("PREPARE", "EVALUATE_ONLY", "EXECUTE_SELECTED", "HOLD"),
@@ -323,6 +323,8 @@ class RuntimeRequest(BehaviorRequest):
         self.candidate_reference, self.origin_lane_id = candidate_reference, origin_lane_id
         self.constraint_ids, self.target_id, self.goal_region = tuple(constraint_ids), target_id, goal_region
         self.follow_clearance_m, self.static_clearance_m = follow_clearance_m, static_clearance_m
+        require(segment_index is None or type(segment_index) is int and segment_index>=0,"invalid execution segment")
+        self.segment_index=segment_index
 
     def identity(self):
         return (self.intent_id, self.stage, self.revision, self.source_frame_id, self.issued_at_s)
@@ -333,17 +335,29 @@ class RuntimeRequest(BehaviorRequest):
                       authorization=self.authorization, origin_lane_id=self.origin_lane_id,
                       candidate_reference=None if self.candidate_reference is None else self.candidate_reference.to_dict(),
                       constraint_ids=list(self.constraint_ids), target_id=self.target_id, goal_region=self.goal_region,
-                      follow_clearance_m=self.follow_clearance_m,static_clearance_m=self.static_clearance_m)
+                      follow_clearance_m=self.follow_clearance_m,static_clearance_m=self.static_clearance_m,segment_index=self.segment_index)
         return result
 
 
 class PlanningFeedback(ExecutionFeedback):
     __slots__ = ("candidate_reference", "clearance_lower_bound_m", "computation_s", "goal_pose",
-                 "segment_directions", "segment_end_poses", "bottleneck")
+                 "segment_directions", "segment_end_poses", "bottleneck", "occupancy_window_s", "candidate_action", "risk_cost", "rule_cost")
 
     def __init__(self, request, frame, status, reason_code="", candidate_reference=None,
                  clearance_lower_bound_m=None, computation_s=0.0, goal_pose=None,
-                 segment_directions=(), segment_end_poses=(), retryable=False):
+                 segment_directions=(), segment_end_poses=(), retryable=False, occupancy_window_s=None, candidate_action=None, risk_cost=None, rule_cost=None):
+        require(finite(computation_s) and computation_s>=0
+                and (clearance_lower_bound_m is None or finite(clearance_lower_bound_m) and clearance_lower_bound_m>=0),
+                'invalid planning measurement')
+        require(len(segment_directions)==len(segment_end_poses)
+                and all(type(v) is int and v in (-1,1) for v in segment_directions)
+                and all(isinstance(v,GoalPose) for v in segment_end_poses),'invalid planning segments')
+        require(occupancy_window_s is None or len(occupancy_window_s)==2
+                and all(finite(v) for v in occupancy_window_s) and occupancy_window_s[0]<=occupancy_window_s[1],
+                'invalid passage time interval')
+        require(candidate_action is None or candidate_action in ('BRAKE','BRAKE_LEFT','BRAKE_RIGHT'),
+                'invalid emergency action')
+        require(all(v is None or finite(v) and v>=0 for v in (risk_cost,rule_cost)), 'invalid emergency ranking')
         super(PlanningFeedback, self).__init__(frame.context, request.intent_id, request.stage,
             request.revision, "planning", request.source_frame_id, frame.frame_id,
             frame.observed_at_s, frame.valid_until_s, status, usable=True,
@@ -353,6 +367,8 @@ class PlanningFeedback(ExecutionFeedback):
         self.computation_s, self.goal_pose = computation_s, goal_pose
         self.segment_directions, self.segment_end_poses = tuple(segment_directions), tuple(segment_end_poses)
         self.bottleneck, self.evidence_level = reason_code, "model_geometry_and_motion_verified"
+        self.occupancy_window_s=occupancy_window_s
+        self.candidate_action,self.risk_cost,self.rule_cost=candidate_action,risk_cost,rule_cost
 
 
 def behavior_frame(perception, now_s):
@@ -411,3 +427,15 @@ def validate_runtime_request(request, frame):
                 and reference.issued_at_s <= request.issued_at_s and finite(reference.valid_until_s),
                 'behavior candidate adoption invalid')
     return request
+
+
+def validate_generator_geometry(perception,settings,frame,required):
+    """The registered generator and controller must share every body extent."""
+    caps=perception.behavior_capabilities
+    require(isinstance(caps,RuntimeCapabilities) and caps.allows(frame,required),
+            'current generator capabilities unavailable')
+    names=('front_offset_m','rear_offset_m','half_width_m','wheelbase_m','front_steer_max_rad')
+    require(all(name in caps.vehicle_geometry and finite(getattr(settings,name,None))
+                and math.isclose(caps.vehicle_geometry[name],getattr(settings,name),rel_tol=1e-9,abs_tol=1e-9)
+                for name in names),'shared vehicle geometry changed or mismatched')
+    return caps

@@ -44,7 +44,11 @@ class BehaviorExchange(object):
         reply.lights_confirmed=sent and lights==(wanted.left_signal,wanted.right_signal,wanted.hazard_signal)
         reply.lights_duration_s=self._lamp_elapsed if reply.lights_confirmed else 0.0
         reply.lights_evidence_level='command_sent' if reply.lights_confirmed else 'unknown'
-        if safety_active:
+        verified_emergency=(trajectory.emergency_maneuver_authorized
+            and request.maneuver=='EMERGENCY' and request.authorization=='EXECUTE_SELECTED'
+            and control.source.endswith(':verified_turn_brake') and current(control,trajectory)
+            and receipt.get('attempted') is True and receipt.get('ok') is True)
+        if safety_active and not verified_emergency:
             reply.usable=False
             reply.reason_code='SAFETY_OVERRIDE_NOT_EXECUTED'
         self.previous.append(reply)

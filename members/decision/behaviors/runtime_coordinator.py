@@ -26,7 +26,14 @@ class RuntimeCoordinator(object):
         self.phase='IDLE'; self.purpose='OVERTAKE'; self._context=None; self._slow_id=None; self._slow_elapsed=0.0
         self._last_frame=None; self._last_time=None; self._reference=None
         self.origin_lane_id=None; self.selected_lane_id=None; self.target_id=None
-        self._settled=0; self.events=[]; self.reason='NO_ACTIVE_BEHAVIOR'
+        self._settled=0; self.events=[]; self._temporary_safety=False; self.reason='NO_ACTIVE_BEHAVIOR'
+
+    def suspend_for_emergency(self,p):
+        if self.phase in ('IDLE','COMPLETE'):return
+        frame=behavior_frame(p,time.monotonic())
+        if self.session.context is None or self.session.context.key()!=frame.context.key():return
+        self._temporary_safety=True
+        self.session.tick(frame,p.behavior_capabilities,safety_override=True)
 
     def _phase(self,frame,phase,reason):
         self.phase,self.reason=phase,reason
@@ -193,6 +200,13 @@ class RuntimeCoordinator(object):
             self._reference=None
             self.session.advance(frame,phase,self._goal(p,lane_id))
             self._phase(frame,phase,'FRESH_GAP_RECOVERY_REEVALUATE')
+        if self._temporary_safety:
+            phase='PREPARE_RETURN' if 'RETURN' in self.phase else 'PREPARE_OUT'
+            self._reference=None;self._settled=0
+            self.session.advance(frame,phase,self._goal(p,lane_id,lights=True),force_revision=True,
+                reason='TEMPORARY_EMERGENCY_ENDED_NEW_LANE_CANDIDATE_REQUIRED')
+            self._phase(frame,phase,'TEMPORARY_EMERGENCY_ENDED_NEW_LANE_CANDIDATE_REQUIRED')
+            self._temporary_safety=False
         goal=self._goal(p,lane_id,lights=self.phase!='PASS')
         self.session.start(frame,self.session.key,self.purpose,self.session.stage,goal,
                            ('LANE_CHANGE','PATH','LIGHTS','FEEDBACK'))

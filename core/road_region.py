@@ -23,14 +23,15 @@ class RoadRegion(object):
             q=tuple(p)
             if not clean or q!=clean[-1]:clean.append(q)
         if clean and clean[0]==clean[-1]:clean.pop()
-        require(len(clean)>=3,'road outline degenerate')
+        require(len(clean)>=3 and len(set(clean))==len(clean),'road outline repeated vertex or degenerate')
         area=sum(a[0]*b[1]-a[1]*b[0] for a,b in zip(clean,clean[1:]+clean[:1]))
         require(abs(area)>1e-8,'road outline zero area')
         edges=list(zip(clean,clean[1:]+clean[:1]))
         for i,(a,b) in enumerate(edges):
             for j,(c,d) in enumerate(edges[i+2:],i+2):
                 if i==0 and j==len(edges)-1:continue
-                require(not (cross(a,b,c)*cross(a,b,d)<-1e-8 and cross(c,d,a)*cross(c,d,b)<-1e-8),
+                require(not (cross(a,b,c)*cross(a,b,d)<-1e-8 and cross(c,d,a)*cross(c,d,b)<-1e-8)
+                        and min(distance(a,c,d),distance(b,c,d),distance(c,a,b),distance(d,a,b))>1e-8,
                         'road outline self-intersects')
         self.points=clean
         self.edges=edges
@@ -44,6 +45,19 @@ class RoadRegion(object):
                 x=a[0]+(point[1]-a[1])*(b[0]-a[0])/(b[1]-a[1])
                 if x>point[0]:contained=not contained
         return contained
+
+    def intersects(self,body):
+        """Exact overlap with a convex footprint, including a concave outline."""
+        if any(self.contains(p) for p in body):return True
+        for p in self.points:
+            signs=[cross(a,b,p) for a,b in zip(body,body[1:]+body[:1])]
+            if all(v>=-1e-8 for v in signs) or all(v<=1e-8 for v in signs):return True
+        for a,b in zip(body,body[1:]+body[:1]):
+            for c,d in self.edges:
+                if (cross(a,b,c)*cross(a,b,d)<-1e-8
+                        and cross(c,d,a)*cross(c,d,b)<-1e-8):return True
+                if min(distance(a,c,d),distance(b,c,d),distance(c,a,b),distance(d,a,b))<1e-8:return True
+        return False
 
     def body_gap(self,body):
         if not all(self.contains(p) for p in body):return 0.0

@@ -129,7 +129,7 @@ class StopPolicyTests(unittest.TestCase):
         self.assertTrue(same.hold_required)
         self.assertFalse(same.request.dispatch_allowed)
 
-    def test_task_switch_and_frame_rollback_reset_completed_stop_ledger(self):
+    def test_task_switch_resets_but_frame_rollback_preserves_completed_stop_ledger(self):
         policy = SignalDwellPolicy()
         f = frame(5, 0.0)
         r = policy.evaluate(f, signal(), caps(f)).request
@@ -142,7 +142,7 @@ class StopPolicyTests(unittest.TestCase):
         self.assertEqual("RECOVER", reset.phase)
         fresh = frame(2, 0.3)
         new = policy.evaluate(fresh, signal(False), caps(fresh))
-        self.assertNotEqual("COMPLETED", new.request.status)
+        self.assertEqual("COMPLETED", new.request.status)
         changed = frame(3, 0.4, context("new"))
         another = policy.evaluate(changed, signal(), caps(changed))
         self.assertNotEqual(new.request.intent_id, another.request.intent_id)

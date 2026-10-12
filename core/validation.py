@@ -55,6 +55,7 @@ def validate_output(value, expected, source):
             raise ValueError("invalid planning feedback")
         if (not number(value.target_speed) or value.target_speed < 0
                 or len(value.points) < 2 or type(value.emergency_stop) is not bool
+                or type(value.emergency_maneuver_authorized) is not bool
                 or type(value.stop_required) is not bool
                 or not number(value.stop_distance) or value.stop_distance < -1):
             raise ValueError("invalid trajectory fields")
@@ -88,7 +89,16 @@ def validate_output(value, expected, source):
                 if dt <= 0 or (ds > 1e-6 and point.speed + previous.speed <= 0):
                     raise ValueError("invalid trajectory timing")
             previous = point
-        if value.emergency_stop and (value.target_speed != 0 or any(p.speed != 0 for p in value.points)):
+        authorized=value.emergency_maneuver_authorized
+        if authorized:
+            request=value.behavior_request
+            if (not isinstance(request,RuntimeRequest) or request.maneuver!='EMERGENCY'
+                    or request.authorization!='EXECUTE_SELECTED' or not value.emergency_stop
+                    or value.execution_path_id!=request.candidate_reference.candidate_id
+                    or value.target_speed!=0 or value.points[-1].speed!=0
+                    or any(b.speed>a.speed+1e-8 for a,b in zip(value.points,value.points[1:]))):
+                raise ValueError('invalid turn/brake authority or braking profile')
+        if value.emergency_stop and (value.target_speed != 0 or not authorized and any(p.speed != 0 for p in value.points)):
             raise ValueError("emergency trajectory contains propulsion")
     elif expected is ControlOut:
         value.clamp()

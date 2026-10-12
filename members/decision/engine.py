@@ -18,6 +18,12 @@ from members.decision.settings import DecisionSettings
 from members.decision.target_history import TargetHistory
 from members.decision.behaviors.coordinator import BehaviorCoordinator
 from members.decision.behaviors.runtime_coordinator import RuntimeCoordinator
+from members.decision.behaviors.parking_runtime import ParkingRuntime
+from members.decision.behaviors.signal_runtime import SignalRuntime
+from members.decision.behaviors.intersection_runtime import IntersectionRuntime
+from members.decision.behaviors.emergency_runtime import EmergencyRuntime
+from members.decision.behaviors.task_runtime import TaskRuntime
+from members.decision.behaviors.blocked_runtime import BlockedRuntime
 
 
 def _link_frame(perception, output):
@@ -40,6 +46,12 @@ class DecisionEngine(object):
         self._history = TargetHistory(self.settings)
         if not preserve_runtime or not hasattr(self, "_runtime_behavior"):
             self._runtime_behavior = RuntimeCoordinator(self.settings)
+            self._parking_runtime = ParkingRuntime()
+            self._signal_runtime = SignalRuntime()
+            self._intersection_runtime = IntersectionRuntime()
+            self._emergency_runtime = EmergencyRuntime()
+            self._task_runtime = TaskRuntime()
+            self._blocked_runtime = BlockedRuntime()
         if hasattr(self, "_behavior"):
             self._behavior.reset()
         else:
@@ -76,9 +88,11 @@ class DecisionEngine(object):
         if self._context is None:
             self._context = context
         if (context != self._context or rolled_back) and trusted:
-            runtime_context = self._runtime_behavior._context
-            preserve = (bool(getattr(perception,"session_id","")) and runtime_context is not None
-                        and perception.session_id == runtime_context[-1])
+            # An active parking/signal obligation may precede any lane intent.
+            # The trusted run identity, rather than one member's local state,
+            # owns whether a frame rollback is a new task.
+            preserve = (bool(getattr(perception,"session_id","")) and self._context is not None
+                        and perception.session_id == self._context[-1])
             self.reset(preserve_runtime=preserve)
             self._context = context
         distinct = self._last_frame is None or frame_id != self._last_frame[0]
@@ -92,9 +106,47 @@ class DecisionEngine(object):
             _link_frame(perception, output)
             distinct = self._observe_frame(perception)
             self._last_constraints = None
-            self._arbitrate(perception, output, distinct)
+            parking=getattr(getattr(perception,'behavior_environment',None),'parking_task',None)
+            handled=False
+            emergency_task=getattr(getattr(perception,'behavior_environment',None),'emergency_task',None)
+            interrupting_emergency=(self._emergency_runtime.active() or emergency_task is not None and emergency_task.dangerous)
+            if parking is None and self._parking_runtime.active():
+                self._protect(output,perception.ego.speed,'PARKING_ENVIRONMENT_LOST',force_emergency=True)
+                handled=True
+            if parking is not None and not interrupting_emergency and protocol.perception_usable(perception) and protocol.targets_usable(perception):
+                output.valid=True;output.mode=DecisionMode.STOP;output.stop_distance=0.0
+                output.target_lane_id=perception.lane.lane_id
+                signed=perception.ego.vx*math.cos(perception.ego.heading)+perception.ego.vy*math.sin(perception.ego.heading)
+                authorized_reverse=(self._parking_runtime.phase.startswith('EXECUTE') and self._parking_runtime.directions
+                    and self._parking_runtime.directions[self._parking_runtime.index]==-1)
+                if signed < -0.05 and not authorized_reverse:
+                    self._protect(output,perception.ego.speed,'UNAUTHORIZED_PARKING_REVERSE',force_emergency=True)
+                    handled=True
+                else:handled=self._parking_runtime.update(perception,output)
+            if not handled:self._arbitrate(perception, output, distinct)
             if output.valid and protocol.perception_usable(perception):
-                self._runtime_behavior.update(perception, output, self._last_constraints, self._history, self._clock())
+                if interrupting_emergency:
+                    self._parking_runtime.suspend_for_emergency(perception)
+                    self._runtime_behavior.suspend_for_emergency(perception)
+                emergency_handled=self._emergency_runtime.update(perception,output)
+                if not handled and not emergency_handled:
+                    self._signal_runtime.update(perception,output,self._behavior._signal_observation(perception,output))
+                    junction_handled=False
+                    if output.behavior_request is None:
+                        junction_handled=self._intersection_runtime.update(perception,output)
+                    if output.behavior_request is None and not junction_handled:
+                        self._runtime_behavior.update(perception,output,self._last_constraints,self._history,self._clock())
+                if not handled and not emergency_handled:
+                    self._blocked_runtime.update(perception,output,self._last_constraints)
+                completed=[]
+                if self._signal_runtime.policy is not None:
+                    completed.extend(self._signal_runtime.policy._completed)
+                if self._parking_runtime.phase=='COMPLETE' and self._parking_runtime.task is not None:
+                    completed.append('parking:'+self._parking_runtime.task.identity)
+                temporary=(self._parking_runtime.active() or self._emergency_runtime.active()
+                    or self._intersection_runtime.active() or self._runtime_behavior.phase not in ('IDLE','COMPLETE')
+                    or output.behavior_request is not None and output.behavior_request.maneuver in ('SIGNAL_STOP','BLOCKED_ROAD'))
+                self._task_runtime.update(perception,output,temporary,completed)
                 try:
                     self._behavior.observe_legacy(perception, output, self._last_constraints, self._clock())
                 except (ValueError, TypeError, AttributeError, KeyError) as exc:
@@ -111,6 +163,16 @@ class DecisionEngine(object):
     def behavior_diagnostics(self):
         result = self._behavior.snapshot()
         result["target_history"] = self._history.snapshot()
+        parking=self._parking_runtime
+        result['parking_runtime']=dict(phase=parking.phase,reason_code=parking.reason,segment_index=parking.index,
+                                     intent_id=parking.session.intent_id,revision=parking.session.revision)
+        task=self._task_runtime
+        result['task_runtime']=dict(phase=task.phase,reason_code=task.reason,recovery_anchor=task.anchor,completed_obligations=sorted(task.completed_obligations))
+        emergency=self._emergency_runtime
+        result['emergency_runtime']=dict(phase=emergency.phase,reason_code=emergency.reason,selected=None if emergency.selected is None else emergency.selected.candidate_action)
+        junction=self._intersection_runtime
+        result['intersection_runtime']=dict(phase=junction.phase,reason_code=junction.reason,
+            condition_at=junction.condition_at,authorized_at=junction.authorized_at,moved_at=junction.moved_at)
         behavior=self._runtime_behavior
         result["runtime_behavior"]=dict(phase=behavior.phase,reason_code=behavior.reason,
             intent_id=behavior.session.intent_id,stage=behavior.session.stage,revision=behavior.session.revision,

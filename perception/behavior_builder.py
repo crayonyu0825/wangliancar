@@ -68,6 +68,44 @@ def build_behavior_environment(p, raw, route_manager):
         source_kind=task_kind if task_allowed else 'unknown')
     destination=task.get('destination')
     goal=GoalPose(destination['x'],destination['y'],destination['body_heading_rad']) if destination else None
+    parking=None
+    parking_raw=observations.get('parking_task')
+    if parking_raw is not None:
+        from core.parking_protocol import ParkingBay,ParkingTask
+        bays=[]
+        for bay in parking_raw.get('bays',[]):
+            bays.append(ParkingBay(bay['id'],bay['boundary'],bay['body_heading_rad'],bay.get('occupancy','unknown'),proof))
+        exit_pose=parking_raw['exit_goal']
+        parking=ParkingTask(parking_raw['id'],task_evidence,bays,parking_raw.get('free_regions',()),
+            GoalPose(exit_pose['x'],exit_pose['y'],exit_pose['body_heading_rad']),
+            parking_raw.get('minimum_dwell_s',10.0),parking_raw.get('ego_target_id'))
+    junction=None
+    junction_raw=observations.get('intersection_task')
+    if junction_raw is not None:
+        from core.intersection_protocol import IntersectionTask
+        junction=IntersectionTask(junction_raw['id'],task_evidence,junction_raw['route'],junction_raw['entry_s_m'],
+            junction_raw['exit_s_m'],junction_raw['conflict_regions'],junction_raw['drivable_region'],
+            junction_raw['exit_region'],junction_raw.get('permission_windows_s',()),
+            junction_raw.get('right_of_way','UNKNOWN'),junction_raw.get('signal_permits') is True,
+            junction_raw.get('speed_cap_mps',2.0),junction_raw.get('exit_gap_m',4.0))
+    emergency=None
+    emergency_raw=observations.get('emergency_task')
+    if emergency_raw is not None:
+        from core.emergency_protocol import EmergencyTask
+        emergency=EmergencyTask(emergency_raw['danger_id'],proof,emergency_raw.get('dangerous') is True,
+            emergency_raw.get('allowed_regions',()),emergency_raw.get('lateral_offsets_m',(0.0,)),
+            emergency_raw.get('return_lane_id'),task_evidence if emergency_raw.get('allowed_regions_verified') is True
+            and emergency_raw.get('rule_permissions_verified') is True else None)
+    progress=None
+    progress_raw=observations.get('task_progress')
+    if progress_raw is not None:
+        from core.task_protocol import TaskRouteFacts
+        destination_raw=progress_raw.get('destination_goal')
+        destination_pose=GoalPose(destination_raw['x'],destination_raw['y'],destination_raw['body_heading_rad']) if destination_raw else None
+        progress=TaskRouteFacts(task_evidence,progress_raw['route_id'],progress_raw['segments'],progress_raw['segment_id'],
+            progress_raw['progress_s_m'],progress_raw['reference_end_reason'],progress_raw.get('destination_region'),destination_pose,
+            progress_raw.get('speed_cap_mps',3.0),progress_raw.get('selected_branch_verified') is True,
+            progress_raw.get('required_obligations',()))
     return BehaviorEnvironment(lanes,coverage,observations.get('road_regions',()),
         task.get('return_lane_id'),task.get('route_id'),goal,task.get('stop_duration_s',0.0),
-        task.get('stop_strict',False),task.get('stop_rule_id'),task_evidence,task.get('desired_lane_id'))
+        task.get('stop_strict',False),task.get('stop_rule_id'),task_evidence,task.get('desired_lane_id'),parking,junction,emergency,progress)

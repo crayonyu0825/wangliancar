@@ -236,7 +236,7 @@ class ObservationCoverage(object):
 class BehaviorEnvironment(object):
     def __init__(self, lanes=(), coverage=None, road_regions=(), return_lane_id=None,
                  task_route_id=None, destination=None, rule_stop_duration_s=0.0,
-                 rule_stop_strict=False, stop_rule_id=None, task_evidence=None, desired_lane_id=None):
+                 rule_stop_strict=False, stop_rule_id=None, task_evidence=None, desired_lane_id=None, parking_task=None, intersection_task=None, emergency_task=None, task_progress=None):
         require(all(isinstance(lane, LaneCorridor) for lane in lanes), "invalid behavior lanes")
         require(coverage is None or isinstance(coverage, ObservationCoverage), "invalid behavior coverage")
         require(all(v is None or isinstance(v, str) for v in (return_lane_id, task_route_id, stop_rule_id)), "invalid task identity")
@@ -250,6 +250,10 @@ class BehaviorEnvironment(object):
         self.task_evidence=task_evidence
         require(desired_lane_id is None or isinstance(desired_lane_id,str) and bool(desired_lane_id),"invalid required task lane")
         self.desired_lane_id=desired_lane_id
+        self.parking_task=parking_task
+        self.intersection_task=intersection_task
+        self.emergency_task=emergency_task
+        self.task_progress=task_progress
 
     def verified_task(self,frame,mode):
         kinds=("synthetic",) if mode=="model" else ("task","verified_fusion")

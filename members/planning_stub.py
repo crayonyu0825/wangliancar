@@ -5,10 +5,16 @@ import math
 from members.planning.lane_planner import build_trajectory, PlannerSettings
 from core.interfaces import DecisionTarget, Trajectory
 from members.planning.behavior_planner import BehaviorPlanner, capabilities
+from members.planning.parking_planner import ParkingPlanner
+from members.planning.intersection_planner import IntersectionPlanner
+from members.planning.emergency_planner import EmergencyPlanner
 
 
 _CONTROL_GEOMETRY = {}
 _BEHAVIOR_PLANNER = BehaviorPlanner()
+_PARKING_PLANNER = ParkingPlanner()
+_INTERSECTION_PLANNER = IntersectionPlanner()
+_EMERGENCY_PLANNER = EmergencyPlanner()
 
 
 def _settings_with_control_geometry():
@@ -29,6 +35,9 @@ def configure_planning(config=None):
     """
     global _CONTROL_GEOMETRY
     _BEHAVIOR_PLANNER.reset()
+    _PARKING_PLANNER.reset()
+    _INTERSECTION_PLANNER.reset()
+    _EMERGENCY_PLANNER.reset()
     geometry = {}
     if config is not None and getattr(config, "control_calibrated", False):
         for name in ("wheelbase_m", "front_steer_max_rad"):
@@ -54,6 +63,35 @@ def plan(perception, decision):
         return output
     fallback = build_trajectory(perception, decision, settings)
     if isinstance(decision, DecisionTarget) and decision.behavior_request is not None:
+        if decision.mode=='EMERGENCY_BRAKE' and decision.behavior_request.maneuver!='EMERGENCY':
+            return fallback
+        if decision.behavior_request.maneuver=='EMERGENCY':
+            return _EMERGENCY_PLANNER.plan(perception,decision,settings,fallback)
+        if decision.behavior_request.maneuver=='BLOCKED_ROAD':
+            fallback.behavior_request=decision.behavior_request
+            fallback.goal_pose=decision.behavior_request.goal.goal_pose
+            fallback.hazard_signal=True
+            return fallback
+        if decision.behavior_request.maneuver=='CONTINUOUS_TASK':
+            fallback.behavior_request=decision.behavior_request
+            fallback.goal_pose=decision.behavior_request.goal.goal_pose
+            return fallback
+        if decision.behavior_request.maneuver=='SIGNAL_STOP':
+            req=decision.behavior_request
+            fallback.behavior_request=req;fallback.hold_duration_s=req.goal.minimum_standstill_duration_s
+            fallback.stop_obligation_id=req.goal.stop_obligation_id;fallback.goal_pose=req.goal.goal_pose
+            fallback.precision_stop=True
+            return fallback
+        if decision.behavior_request.maneuver in ('INTERSECTION','CROSSWALK','JUNCTION_ENTRY'):
+            return _INTERSECTION_PLANNER.plan(perception,decision,settings,fallback)
+        if decision.behavior_request.maneuver=='PARK':
+            if not fallback.valid or decision.behavior_request.authorization=='EVALUATE_ONLY':
+                from core.interfaces import TrajectoryPoint
+                fallback=Trajectory().bind(decision);fallback.valid=True;fallback.target_speed=0.0
+                fallback.stop_required=True;fallback.stop_distance=0.0
+                fallback.points=[TrajectoryPoint(perception.ego.x,perception.ego.y,0,perception.ego.heading,0),
+                                 TrajectoryPoint(perception.ego.x,perception.ego.y,0,perception.ego.heading,0.1)]
+            return _PARKING_PLANNER.plan(perception,decision,settings,fallback)
         return _BEHAVIOR_PLANNER.plan(perception, decision, settings, fallback)
     return fallback
 

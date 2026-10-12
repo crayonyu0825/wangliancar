@@ -56,6 +56,7 @@ class StandstillGuard(object):
     """
 
     def __init__(self):
+        self.obligation_id = None
         self.duration = 0.0
         self.elapsed = 0.0
         self.anchor = None
@@ -74,11 +75,15 @@ class StandstillGuard(object):
         duration = getattr(trajectory, "hold_duration_s", 0.0)
         if duration <= 0 or self.active:
             return
+        identity=getattr(trajectory,'stop_obligation_id',None)
+        if identity is not None and identity==self.obligation_id and self.anchor is not None and self.elapsed>=self.duration:
+            return
         # An unchanged completed stop must not start a new ten-second dwell
         # every frame. A genuinely different stop can request a new dwell.
-        if (self.anchor is not None and self.elapsed >= self.duration and
+        if (identity is None and self.anchor is not None and self.elapsed >= self.duration and
                 math.hypot(ego.x - self.anchor[0], ego.y - self.anchor[1]) < 0.3):
             return
+        self.obligation_id=identity
         self.duration, self.elapsed = duration, 0.0
         self.anchor = (ego.x, ego.y, ego.heading)
         self.direction = getattr(trajectory, "motion_direction", 1)

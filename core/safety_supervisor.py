@@ -37,6 +37,7 @@ class SafetySupervisor(object):
 
     def __init__(self, config, clock=None, planning_settings=None, decision_settings=None):
         self.clock = clock or time.monotonic
+        self.maneuver_settings=planning_settings
         self.repeat_fault_ms = max(1, int(getattr(config, "pipeline_timeout_ms", 200)))
         self.last_gps_ms = max(1, int(getattr(config, "sensor_timeout_ms", 500)))
         self.recovery_frames = max(1, int(getattr(config, "safety_recovery_frames", 3)))
@@ -248,6 +249,10 @@ class SafetySupervisor(object):
             mode, reason = "fault_stop", "trajectory_invalid_or_expired"
         elif trajectory.emergency_stop:
             mode, reason = "emergency_stop", "trajectory_emergency_request"
+        elif not self._parking_path_safe(perception,decision,trajectory):
+            mode,reason="controlled_stop","parking_authority_or_path_unverified"
+        elif not self._intersection_path_safe(perception,decision,trajectory):
+            mode,reason="controlled_stop","junction_authority_or_path_unverified"
         elif (self.normal_control_required and new_frame and control is not None
               and not current(control, trajectory)):
             mode, reason = "fault_stop", "controller_invalid_or_expired"
@@ -262,9 +267,30 @@ class SafetySupervisor(object):
                 mode, reason = "controlled_stop", "recovery_waiting_for_fresh_frames"
             else:
                 self.recovering, self.good_frames = False, 0
+        proposed_control=control
         control = self._candidate(mode, reason, now,
                                   perception.valid_until if gps_ok else None)
+        if (mode=='emergency_stop' and reason in ('imminent_target_collision','collision_or_emergency_request','trajectory_emergency_request')
+                and control is not None and proposed_control is not None and current(proposed_control,trajectory)
+                and proposed_control.throttle==0 and proposed_control.brake>0):
+            from core.maneuver_guard import emergency_path_is_safe
+            if emergency_path_is_safe(perception,decision,trajectory,self.maneuver_settings):
+                # Keep the supervisor's emergency brake, zero throttle and
+                # neutral gear. Only the freshly revalidated steering survives.
+                control.steering=proposed_control.steering
+                control.source+=':verified_turn_brake';control.clamp()
+                # The pose/speed are observations from this cycle, not a claim
+                # that the planned endpoint or nominal timing was achieved.
+                control.execution_feedback=proposed_control.execution_feedback
         return SafetyAssessment(mode, reason, control)
+
+    def _parking_path_safe(self,perception,decision,trajectory):
+        from core.maneuver_guard import parking_path_is_safe
+        return parking_path_is_safe(perception,decision,trajectory,self.maneuver_settings)
+
+    def _intersection_path_safe(self,perception,decision,trajectory):
+        from core.maneuver_guard import intersection_path_is_safe
+        return intersection_path_is_safe(perception,decision,trajectory,self.maneuver_settings)
 
     def _candidate(self, mode, reason, now, source_deadline):
         if mode == "normal" or self.last_good_header is None:
