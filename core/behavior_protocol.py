@@ -186,7 +186,7 @@ class ExecutionFeedback(object):
                  "status", "reason_code", "retryable", "progress", "actual_standstill_confirmed",
                  "goal_pose_arrived", "standstill_duration_s", "hold_completed", "lights_confirmed",
                  "motion_direction", "actual_pose", "actual_lane_id", "lights_duration_s", "candidate_id",
-                 "lights_evidence_level", "evidence_level", "control_limited", "actual_progress_m")
+                 "lights_evidence_level", "evidence_level", "control_limited", "actual_progress_m", "actual_speed_mps")
 
     def __init__(self, context, intent_id, stage, revision, producer, source_frame_id,
                  produced_frame_id, produced_at_s, valid_until_s, status,
@@ -195,7 +195,7 @@ class ExecutionFeedback(object):
                  standstill_duration_s=0.0, hold_completed=False, lights_confirmed=False,
                  motion_direction=1, actual_pose=None, clock_id="process_monotonic",
                  actual_lane_id=None, lights_duration_s=0.0, candidate_id=None,
-                 lights_evidence_level="unknown", evidence_level="unknown", control_limited=False, actual_progress_m=0.0):
+                 lights_evidence_level="unknown", evidence_level="unknown", control_limited=False, actual_progress_m=0.0, actual_speed_mps=0.0):
         self.context, self.intent_id, self.stage, self.revision = context, intent_id, stage, revision
         self.producer, self.source_frame_id, self.produced_frame_id = producer, source_frame_id, produced_frame_id
         self.produced_at_s, self.valid_until_s, self.clock_id = produced_at_s, valid_until_s, clock_id
@@ -208,6 +208,7 @@ class ExecutionFeedback(object):
         self.candidate_id = candidate_id
         self.lights_evidence_level, self.evidence_level = lights_evidence_level, evidence_level
         self.control_limited, self.actual_progress_m = control_limited, actual_progress_m
+        self.actual_speed_mps = actual_speed_mps
 
 
 class FeedbackValidator(object):
@@ -257,6 +258,8 @@ class FeedbackValidator(object):
                 or (feedback.actual_lane_id is not None and not isinstance(feedback.actual_lane_id, str))
                 or not finite(feedback.lights_duration_s) or feedback.lights_duration_s < 0
                 or not finite(feedback.actual_progress_m) or feedback.actual_progress_m < 0
+                or not finite(feedback.actual_speed_mps) or feedback.actual_speed_mps < 0
+                or type(feedback.control_limited) is not bool
                 or not isinstance(feedback.reason_code, str)
                 or (feedback.candidate_id is not None and not isinstance(feedback.candidate_id, str))):
             return False, "FEEDBACK_VALUES", False

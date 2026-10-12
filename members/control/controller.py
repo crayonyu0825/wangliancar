@@ -148,7 +148,10 @@ class ControlEngine(object):
             standstill_duration_s=self.standstill.elapsed if arrived and stopped else 0.0,
             hold_completed=hold_complete, motion_direction=trajectory.motion_direction,
             candidate_id=trajectory.execution_path_id,
-            progress=1.0 if arrived else 0.0, actual_progress_m=distance,
+            progress=1.0 if arrived else 0.0, actual_progress_m=distance,actual_speed_mps=ego.speed,
+            control_limited=(self.calibration is not None and (
+                output.throttle>=self.calibration.max_throttle-1e-6
+                or output.brake>=self.calibration.max_brake-1e-6 or abs(output.steering)>=1-1e-6)),
             evidence_level="observed_pose_and_speed")
 
     def compute(self, perception, trajectory):

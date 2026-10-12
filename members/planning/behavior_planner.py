@@ -11,7 +11,7 @@ import copy
 
 from core.interfaces import Trajectory, TrajectoryPoint
 from core.validation import current
-from core.geometry import project_polyline, normalize_angle
+from core.geometry import project_polyline, normalize_angle, projection_within_polyline
 from core.behavior_protocol import (RuntimeRequest, CandidateReference, PlanningFeedback,
     Capabilities, RuntimeCapabilities, behavior_frame, GoalPose, PROTOCOL_VERSION, validate_runtime_request)
 from core.behavior_environment import BehaviorEnvironment, vehicle_footprint
@@ -52,9 +52,17 @@ def at(points, arc, value):
     if length <= 1e-8:
         raise ValueError("degenerate lane")
     u = (value-arc[i])/length
-    return (points[i][0]+u*(points[i+1][0]-points[i][0]),
-            points[i][1]+u*(points[i+1][1]-points[i][1]),
-            math.atan2(points[i+1][1]-points[i][1], points[i+1][0]-points[i][0]))
+    def tangent(index):
+        lo,hi=max(0,index-1),min(len(points)-1,index+1)
+        ds=arc[hi]-arc[lo]
+        if ds<=1e-8:raise ValueError('reference tangent unavailable')
+        return ((points[hi][0]-points[lo][0])/ds,(points[hi][1]-points[lo][1])/ds)
+    first,last=tangent(i),tangent(i+1)
+    h00,h10,h01,h11=2*u**3-3*u**2+1,u**3-2*u**2+u,-2*u**3+3*u**2,u**3-u**2
+    d00,d10,d01,d11=6*u*u-6*u,3*u*u-4*u+1,-6*u*u+6*u,3*u*u-2*u
+    position=[h00*points[i][j]+h10*length*first[j]+h01*points[i+1][j]+h11*length*last[j] for j in (0,1)]
+    derivative=[d00*points[i][j]+d10*length*first[j]+d01*points[i+1][j]+d11*length*last[j] for j in (0,1)]
+    return position[0],position[1],math.atan2(derivative[1],derivative[0])
 
 
 class BehaviorPlanner(object):
@@ -85,6 +93,7 @@ class BehaviorPlanner(object):
             raise ValueError("lane maneuver length unavailable")
         if not target.legal(behavior_frame(p, time.monotonic()), start_s, start_s+length):
             raise ValueError("crossing permission outside verified range")
+        target_arc=stations(target.center_line)
         base = at(origin.center_line, arc, start_s)
         offset = -(p.ego.x-base[0])*math.sin(base[2])+(p.ego.y-base[1])*math.cos(base[2])
         raw = []
@@ -92,11 +101,12 @@ class BehaviorPlanner(object):
             distance = min(length+12.0, i*settings.behavior_point_spacing_m)
             x, y, heading = at(origin.center_line, arc, start_s+distance)
             other = project_polyline(target.center_line, x, y)
-            if other is None or not 0 <= other['raw_ratio'] <= 1:
+            if other is None or not projection_within_polyline(other,len(target.center_line)):
                 raise ValueError("target lane coverage unavailable")
             u = min(1.0, distance/length)
             blend = 10*u**3-15*u**4+6*u**5
-            delta = -(other['point'][0]-x)*math.sin(heading)+(other['point'][1]-y)*math.cos(heading)
+            other_point=at(target.center_line,target_arc,other['s'])
+            delta = -(other_point[0]-x)*math.sin(heading)+(other_point[1]-y)*math.cos(heading)
             lateral = offset*(1-blend)+delta*blend
             raw.append((x-math.sin(heading)*lateral, y+math.cos(heading)*lateral))
         raw[0] = (p.ego.x, p.ego.y)
@@ -111,7 +121,7 @@ class BehaviorPlanner(object):
         a=project_polyline(origin.center_line,p.ego.x,p.ego.y) if origin else None
         b=project_polyline(origin.center_line,lead.x,lead.y) if origin and lead else None
         cap=request.goal.speed_cap_mps
-        if target is not None and not target.contains(body) and a is not None and b is not None and b['s']>a['s']:
+        if request.maneuver=='OVERTAKE' and target is not None and not target.contains(body) and a is not None and b is not None and b['s']>a['s']:
             speed=math.cos(b['heading'])*lead.vx+math.sin(b['heading'])*lead.vy
             cap=min(cap,max(0.05,speed))
         return cap
@@ -132,7 +142,7 @@ class BehaviorPlanner(object):
         # Keep the current follow cap while the body still shares the followed
         # object's strip. Once geometrically separated, allow overtake speed.
         lead = next((t for t in p.targets if t.id == request.target_id), None)
-        if lead is not None:
+        if lead is not None and request.maneuver=='OVERTAKE':
             for i, point in enumerate(raw):
                 lateral = abs(-(lead.x-point[0])*math.sin(headings[i])+(lead.y-point[1])*math.cos(headings[i]))
                 if lateral < settings.half_width_m+lead.width/2+0.2:
@@ -159,9 +169,12 @@ class BehaviorPlanner(object):
 
     def _validate(self, p, request, settings, points):
         env, coverage = p.behavior_environment, p.behavior_environment.coverage
+        if not coverage.timing_verified(behavior_frame(p,time.monotonic()),p.observation_mode):
+            raise ValueError('execution timing bounds or evidence unavailable')
         vehicle = VehicleGeometry(settings.front_offset_m,settings.rear_offset_m,settings.half_width_m,settings.wheelbase_m)
         limits = MotionLimits(max(request.goal.speed_cap_mps,p.ego.speed)+0.1,
-            settings.acceleration,settings.deceleration,settings.lateral_acceleration,
+            settings.acceleration,settings.deceleration,min(settings.lateral_acceleration,
+                settings.max_lateral_acceleration_mps2 if settings.max_lateral_acceleration_mps2 is not None else settings.lateral_acceleration),
             settings.front_steer_max_rad,settings.behavior_steer_rate_rad_s,0.2,0.05)
         obstacles=[]
         for t in p.targets:
@@ -170,10 +183,23 @@ class BehaviorPlanner(object):
             if t.valid is not True or min(t.length,t.width) <= 0:
                 raise ValueError("target dimensions invalid")
             # Business net distance remains longitudinal in overlapping strips.
-            clearance = request.follow_clearance_m if t.id == request.target_id else request.static_clearance_m
-            obstacles.append(ObstaclePrediction(str(t.id),t.x,t.y,t.length+2*clearance,t.width,
-                t.heading,t.vx,t.vy,coverage.prediction_horizon_s,
-                coverage.position_uncertainty_m,coverage.velocity_uncertainty_mps))
+            clearance = request.follow_clearance_m if t.id == request.target_id and request.maneuver=='OVERTAKE' else request.static_clearance_m
+            length,width,heading=t.length,t.width,t.heading
+            if heading is None:
+                diameter=math.hypot(length,width)
+                length,width=diameter,diameter
+                lane=env.lane(t.lane_id) or env.lane(request.origin_lane_id)
+                projection=project_polyline(lane.center_line,t.x,t.y) if lane else None
+                if projection is None:
+                    raise ValueError('unknown-heading clearance axis unavailable')
+                # A road-aligned square contains the entire orientation-free
+                # physical circle. The longitudinal business expansion must
+                # not turn into a twelve-metre *lateral* collision circle.
+                heading=projection['heading']
+            obstacles.append(ObstaclePrediction(str(t.id),t.x,t.y,length+2*clearance,width,
+                heading,t.vx,t.vy,coverage.prediction_horizon_s,
+                coverage.position_uncertainty_m,coverage.velocity_uncertainty_mps,
+                coverage.time_early_error_s,coverage.time_late_error_s))
         if not all(coverage.contains(vehicle_footprint(GoalPose(q.x,q.y,q.heading),
                  settings.front_offset_m,settings.rear_offset_m,settings.half_width_m)) for q in points):
             raise ValueError("candidate leaves observed coverage")

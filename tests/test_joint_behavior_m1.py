@@ -56,7 +56,7 @@ class JointM1Tests(unittest.TestCase):
         target=add_target(p,self.lead_x-self.plant.x,1.4,lane_id='lane-1')
         target.x,target.y=self.lead_x,0.0
         coverage=ObservationCoverage(proof,[[(-95,-8),(395,-8),(395,9),(-95,9)]],
-            ('front','side','rear'),'model-all-actors','model_complete_world',0.05,0.01,60.0)
+            ('front','side','rear'),'model-all-actors','model_complete_world',0.05,0.01,60.0,0.1,1.0,proof)
         p.behavior_environment=BehaviorEnvironment(lanes,coverage,
             [[(-90,-1.75),(390,-1.75),(390,5.25),(-90,5.25)]],
             'lane-1' if return_required else None,'model-route',task_evidence=proof)
@@ -197,6 +197,8 @@ class RuntimeModelM1Tests(unittest.TestCase):
                     dynamic_coverage=dict(coverage_complete=True,regions=[[(-95,-8),(395,-8),(395,9),(-95,9)]],
                         scope=['front','side','rear'],proof_id='model-all-actors',proof_kind='model_complete_world',
                         position_uncertainty_m=0.05,velocity_uncertainty_mps=0.01,prediction_horizon_s=60.0),
+                    execution_timing=dict(max_early_s=0.1,max_late_s=1.0,bounds_verified=True,
+                        source='explicit_model_control_bound',source_kind='synthetic'),
                     road_regions=[[(-90,-1.75),(390,-1.75),(390,5.25),(-90,5.25)]],
                     task=dict(route_id='model-route',return_lane_id='1_0_-1',route_verified=True,
                         source='explicit_model_task',source_kind='synthetic'))

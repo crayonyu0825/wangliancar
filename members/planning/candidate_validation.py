@@ -15,6 +15,8 @@ import time
 
 from core.geometry import normalize_angle
 from core.validation import number
+from core.road_region import RoadRegion
+from core.behavior_environment import hull
 
 
 EPS = 1e-9
@@ -50,12 +52,14 @@ class ObstaclePrediction(object):
     Uncertainty is a position-radius + velocity-radius*t Minkowski expansion.
     """
     def __init__(self, identity, x, y, length, width, heading, vx, vy,
-                 valid_until_s, position_uncertainty_m, velocity_uncertainty_mps):
+                 valid_until_s, position_uncertainty_m, velocity_uncertainty_mps,
+                 time_early_error_s=0.0,time_late_error_s=0.0):
         self.identity, self.x, self.y = identity, x, y
         self.length, self.width, self.heading = length, width, heading
         self.vx, self.vy, self.valid_until_s = vx, vy, valid_until_s
         self.position_uncertainty_m = position_uncertainty_m
         self.velocity_uncertainty_mps = velocity_uncertainty_mps
+        self.time_early_error_s,self.time_late_error_s=time_early_error_s,time_late_error_s
 
 
 class ValidationBudget(object):
@@ -104,6 +108,9 @@ def _edges(polygon):
 
 
 def _corridor(raw, checks):
+    if isinstance(raw,RoadRegion):
+        checks.consume()
+        return raw
     if not isinstance(raw, (list, tuple)) or len(raw) < 3:
         _invalid("explicit convex corridor polygon required")
     polygon = []
@@ -186,14 +193,22 @@ def _circle_gap(polygon, x, y, radius):
 
 
 def _obstacle_gap(body, obstacle, at):
-    x, y = obstacle.x+obstacle.vx*at, obstacle.y+obstacle.vy*at
-    uncertainty = obstacle.position_uncertainty_m + obstacle.velocity_uncertainty_mps*at
-    _finite((x, y, uncertainty))
-    if obstacle.heading is None:
-        return _circle_gap(body, x, y, math.hypot(obstacle.length, obstacle.width)*.5 + uncertainty)
-    shape = _rectangle(x, y, obstacle.heading, obstacle.length*.5,
-                       obstacle.length*.5, obstacle.width*.5)
-    return _polygon_gap(body, shape)-uncertainty
+    low=max(0.0,at-obstacle.time_early_error_s)
+    high=at+obstacle.time_late_error_s
+    uncertainty=obstacle.position_uncertainty_m+obstacle.velocity_uncertainty_mps*high
+    if obstacle.heading is None and low==high:
+        return _circle_gap(body,obstacle.x+obstacle.vx*at,obstacle.y+obstacle.vy*at,
+                           math.hypot(obstacle.length,obstacle.width)*.5+uncertainty)
+    heading=obstacle.heading
+    length,width=obstacle.length,obstacle.width
+    if heading is None:
+        length=width=math.hypot(length,width)
+        heading=math.atan2(obstacle.vy,obstacle.vx) if obstacle.vx or obstacle.vy else 0.0
+    endpoints=[]
+    for value in (low,high):
+        endpoints.extend(_rectangle(obstacle.x+obstacle.vx*value,obstacle.y+obstacle.vy*value,
+                        heading,length*.5,length*.5,width*.5))
+    return _polygon_gap(body,hull(endpoints))-uncertainty
 
 
 def _motion(points, direction, vehicle, limits, checks):
@@ -316,8 +331,9 @@ def _sweep(segments, vehicle, planes, obstacles, checks):
         pose, u = _pose(segment, at)
         body = _rectangle(pose[0], pose[1], pose[2], vehicle.front_offset_m,
                           vehicle.rear_offset_m, vehicle.half_width_m)
-        road = min((p[0]-origin[0])*normal[0]+(p[1]-origin[1])*normal[1]
-                   for origin, normal in planes for p in body)
+        road = (planes.body_gap(body) if isinstance(planes,RoadRegion) else
+                min((p[0]-origin[0])*normal[0]+(p[1]-origin[1])*normal[1]
+                    for origin, normal in planes for p in body))
         if road <= EPS:
             raise _Stop("unsafe", "CORRIDOR_COLLISION", "corridor", relative_time_s=at)
         result = [road]
@@ -410,12 +426,14 @@ def validate_candidate(points, motion_direction, vehicle, limits, corridor, obst
             _finite((obstacle.x, obstacle.y, obstacle.vx, obstacle.vy))
             if obstacle.heading is not None:
                 _finite((obstacle.heading,))
-            for name in ("length", "width", "valid_until_s", "position_uncertainty_m", "velocity_uncertainty_mps"):
-                _positive(name, getattr(obstacle, name), name.endswith("uncertainty_m") or name.endswith("uncertainty_mps"))
+            for name in ("length", "width", "valid_until_s", "position_uncertainty_m", "velocity_uncertainty_mps",
+                         "time_early_error_s","time_late_error_s"):
+                _positive(name,getattr(obstacle,name),name.endswith("uncertainty_m") or name.endswith("uncertainty_mps")
+                          or name.endswith("error_s"))
         planes = _corridor(corridor, checks)
         segments, horizon = _motion(points, motion_direction, vehicle, limits, checks)
         for obstacle in obstacles:
-            if horizon > obstacle.valid_until_s:
+            if horizon+obstacle.time_late_error_s > obstacle.valid_until_s:
                 raise _Stop("inconclusive", "PREDICTION_HORIZON", "prediction_horizon",
                             obstacle_id=obstacle.identity, required_horizon_s=horizon)
         clearance = _sweep(segments, vehicle, planes, obstacles, checks)

@@ -319,7 +319,9 @@ class DecisionEngine(object):
                 self._static_targets.clear()
                 self._moving_confirm.clear()
                 self._target_hazard_ids.clear()
-        for kind, identifier, demand, reason in self._history.retained_constraints(ego_speed, cruising):
+        memories=(self._history.retained_constraints(ego_speed,cruising)
+                  +self._history.missing_danger_constraints(perception))
+        for kind, identifier, demand, reason in memories:
             result.add(kind, "target_history", identifier,
                        "{0}:id={1}".format(reason, identifier), speed=demand,
                        valid_until=perception.valid_until)

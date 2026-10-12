@@ -2,6 +2,7 @@
 
 import math
 from core.behavior_protocol import TaskContext, GoalPose, finite, require
+from core.road_region import RoadRegion
 
 
 class Evidence(object):
@@ -198,7 +199,8 @@ class LaneCorridor(object):
 
 class ObservationCoverage(object):
     def __init__(self, evidence, regions=(), scope=(), proof_id="", proof_kind="unknown",
-                 position_uncertainty_m=None, velocity_uncertainty_mps=None, prediction_horizon_s=None):
+                 position_uncertainty_m=None, velocity_uncertainty_mps=None, prediction_horizon_s=None,
+                 time_early_error_s=None,time_late_error_s=None,timing_evidence=None):
         require(isinstance(evidence, Evidence), "coverage evidence missing")
         self.evidence, self.regions = evidence, tuple(polygon(p) for p in regions)
         self.scope, self.proof_id, self.proof_kind = frozenset(scope), proof_id, proof_kind
@@ -206,6 +208,17 @@ class ObservationCoverage(object):
             require(v is None or finite(v) and v >= 0, "invalid prediction uncertainty")
         self.position_uncertainty_m, self.velocity_uncertainty_mps = position_uncertainty_m, velocity_uncertainty_mps
         self.prediction_horizon_s = prediction_horizon_s
+        require(all(v is None or finite(v) and v>=0 for v in (time_early_error_s,time_late_error_s)),
+                "invalid execution timing bounds")
+        require(timing_evidence is None or isinstance(timing_evidence,Evidence),"invalid timing evidence")
+        self.time_early_error_s,self.time_late_error_s=time_early_error_s,time_late_error_s
+        self.timing_evidence=timing_evidence
+
+    def timing_verified(self,frame,mode):
+        kinds=("synthetic",) if mode=="model" else ("verified_fusion","planning")
+        return (self.time_early_error_s is not None and self.time_late_error_s is not None
+                and self.timing_evidence is not None
+                and self.timing_evidence.verified(frame,allowed_source_kinds=kinds))
 
     def verified(self, frame, mode="production", required=("front", "side", "rear")):
         source_kinds = ("sensor", "verified_fusion") if mode == "production" else ("synthetic",)
@@ -223,18 +236,20 @@ class ObservationCoverage(object):
 class BehaviorEnvironment(object):
     def __init__(self, lanes=(), coverage=None, road_regions=(), return_lane_id=None,
                  task_route_id=None, destination=None, rule_stop_duration_s=0.0,
-                 rule_stop_strict=False, stop_rule_id=None, task_evidence=None):
+                 rule_stop_strict=False, stop_rule_id=None, task_evidence=None, desired_lane_id=None):
         require(all(isinstance(lane, LaneCorridor) for lane in lanes), "invalid behavior lanes")
         require(coverage is None or isinstance(coverage, ObservationCoverage), "invalid behavior coverage")
         require(all(v is None or isinstance(v, str) for v in (return_lane_id, task_route_id, stop_rule_id)), "invalid task identity")
         require(destination is None or isinstance(destination, GoalPose), "invalid task destination")
         require(finite(rule_stop_duration_s) and rule_stop_duration_s >= 0 and type(rule_stop_strict) is bool, "invalid stop policy")
         self.lanes, self.coverage = tuple(lanes), coverage
-        self.road_regions = tuple(polygon(p) for p in road_regions)
+        self.road_regions = tuple(RoadRegion(p) for p in road_regions)
         self.return_lane_id, self.task_route_id, self.destination = return_lane_id, task_route_id, destination
         self.rule_stop_duration_s, self.rule_stop_strict, self.stop_rule_id = rule_stop_duration_s, rule_stop_strict, stop_rule_id
         require(task_evidence is None or isinstance(task_evidence,Evidence),"invalid task evidence")
         self.task_evidence=task_evidence
+        require(desired_lane_id is None or isinstance(desired_lane_id,str) and bool(desired_lane_id),"invalid required task lane")
+        self.desired_lane_id=desired_lane_id
 
     def verified_task(self,frame,mode):
         kinds=("synthetic",) if mode=="model" else ("task","verified_fusion")

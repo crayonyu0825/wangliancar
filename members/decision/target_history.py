@@ -47,6 +47,8 @@ class TargetHistory(object):
 
     def reset(self):
         self.tracks = OrderedDict()
+        self._danger_memory = OrderedDict()
+        self._danger_clear_counts = {}
         self._context, self._source, self._last_frame, self._last_time = None, None, None, None
         self._now, self._usable, self._record, self._seen = 0.0, False, False, set()
         self.events = deque(maxlen=128)
@@ -65,7 +67,11 @@ class TargetHistory(object):
                   else "GPS_ROLLBACK" if rolled else "CLOCK_ROLLBACK" if clock_back else "")
         self.reset_reason = reason
         if reason:
+            danger=dict(self._danger_memory)
             self.reset()
+            if reason in ('SOURCE_CHANGED','GPS_ROLLBACK','CLOCK_ROLLBACK'):
+                self._danger_memory=OrderedDict(danger)
+                self._danger_clear_counts={identifier:0 for identifier in danger}
             self.reset_reason = reason
             self.events.append(dict(frame_id=perception.frame_id, reason=reason))
         gap = self._last_time is not None and distinct and now_s - self._last_time > self.settings.history_max_gap_s
@@ -108,6 +114,14 @@ class TargetHistory(object):
                                         reason="ID_DISCONTINUITY"))
             else:
                 track.quality = "CONTINUOUS"
+        if sample.dangerous:
+            self._danger_memory[identifier]=(target.x,target.y,target.length,target.width,target.heading)
+            self._danger_clear_counts[identifier]=0
+            while len(self._danger_memory)>self.settings.history_max_tracks:
+                oldest=next(iter(self._danger_memory));self._danger_memory.pop(oldest,None)
+                self._danger_clear_counts.pop(oldest,None)
+        else:
+            self._danger_memory.pop(identifier,None);self._danger_clear_counts.pop(identifier,None)
         track.samples.append(sample)
         track.relation = candidate.relation
         if candidate.lateral_offset_m is not None and candidate.lateral_speed is not None:
@@ -165,10 +179,36 @@ class TargetHistory(object):
                 result.append(("FOLLOW", identifier, demand, "HANDOFF_PREVIOUS_LEAD_CAP"))
         return result
 
+    def missing_danger_constraints(self,perception):
+        """Aging an ID is not coverage proof. Preserve a separate bounded duty."""
+        if not perception.session_id:
+            return []  # Legacy protocol keeps its established release gate.
+        from core.behavior_environment import BehaviorEnvironment,vehicle_footprint
+        from core.behavior_protocol import behavior_frame,GoalPose
+        env=perception.behavior_environment
+        frame=behavior_frame(perception,self._now)
+        covered=(isinstance(env,BehaviorEnvironment) and env.coverage is not None
+                 and env.coverage.verified(frame,perception.observation_mode))
+        result=[]
+        for identifier,shape in list(self._danger_memory.items()):
+            if identifier in self._seen:continue
+            x,y,length,width,heading=shape
+            if heading is None:
+                length=width=math.hypot(length,width);heading=0.0
+            footprint=vehicle_footprint(GoalPose(x,y,heading),length/2,length/2,width/2)
+            clear=covered and env.coverage.contains(footprint)
+            if self._record:
+                self._danger_clear_counts[identifier]=(self._danger_clear_counts.get(identifier,0)+1) if clear else 0
+            if clear and self._danger_clear_counts.get(identifier,0)>=self.settings.release_frames:
+                self._danger_memory.pop(identifier,None);self._danger_clear_counts.pop(identifier,None)
+            else:
+                result.append(('PROTECT',identifier,None,'DANGER_CLEARANCE_COVERAGE_UNVERIFIED'))
+        return result
+
     def snapshot(self):
         return dict(time_basis="local_monotonic_arrival_s", source=self._source,
                     reset_reason=self.reset_reason,
-                    track_count=len(self.tracks), tracks=[dict(
+                    track_count=len(self.tracks), unresolved_danger_ids=list(self._danger_memory),tracks=[dict(
                         target_id=identifier, quality=track.quality, relation=track.relation,
                         handoff_state=track.handoff_state, was_followed=track.was_followed,
                         sample_count=len(track.samples), last_frame_id=track.samples[-1].frame_id,

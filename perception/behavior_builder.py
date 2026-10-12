@@ -32,9 +32,17 @@ def build_behavior_environment(p, raw, route_manager):
     proof=Evidence(context,source_frame,source_time,source_until,usable=bool(fresh and allowed and official),
         coverage_verified=dynamic.get('coverage_complete') is True,
         source=source,source_kind=kind if allowed else 'unknown')
+    timing=observations.get('execution_timing',{})
+    timing_kind=timing.get('source_kind','unknown')
+    timing_allowed=(timing_kind=='synthetic' if p.observation_mode=='model' else timing_kind in ('planning','verified_fusion'))
+    timing_evidence=Evidence(context,source_frame,source_time,source_until,
+        usable=bool(fresh and timing_allowed and timing.get('bounds_verified') is True),
+        coverage_verified=timing.get('bounds_verified') is True,source=timing.get('source','unknown'),
+        source_kind=timing_kind if timing_allowed else 'unknown')
     coverage=ObservationCoverage(proof,dynamic.get('regions',()),dynamic.get('scope',()),
         dynamic.get('proof_id',''),dynamic.get('proof_kind','unknown'),
-        dynamic.get('position_uncertainty_m'),dynamic.get('velocity_uncertainty_mps'),dynamic.get('prediction_horizon_s'))
+        dynamic.get('position_uncertainty_m'),dynamic.get('velocity_uncertainty_mps'),dynamic.get('prediction_horizon_s'),
+        timing.get('max_early_s'),timing.get('max_late_s'),timing_evidence)
     lanes=[]
     lane_data=observations.get('lanes',[])
     supplied_lanes=bool(lane_data)
@@ -62,4 +70,4 @@ def build_behavior_environment(p, raw, route_manager):
     goal=GoalPose(destination['x'],destination['y'],destination['body_heading_rad']) if destination else None
     return BehaviorEnvironment(lanes,coverage,observations.get('road_regions',()),
         task.get('return_lane_id'),task.get('route_id'),goal,task.get('stop_duration_s',0.0),
-        task.get('stop_strict',False),task.get('stop_rule_id'),task_evidence)
+        task.get('stop_strict',False),task.get('stop_rule_id'),task_evidence,task.get('desired_lane_id'))

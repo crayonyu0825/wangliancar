@@ -23,7 +23,7 @@ class RuntimeCoordinator(object):
 
     def reset(self):
         self.session=BehaviorSession(progress_timeout_s=self.settings.trajectory_progress_timeout_s)
-        self.phase='IDLE'; self._context=None; self._slow_id=None; self._slow_elapsed=0.0
+        self.phase='IDLE'; self.purpose='OVERTAKE'; self._context=None; self._slow_id=None; self._slow_elapsed=0.0
         self._last_frame=None; self._last_time=None; self._reference=None
         self.origin_lane_id=None; self.selected_lane_id=None; self.target_id=None
         self._settled=0; self.events=[]; self.reason='NO_ACTIVE_BEHAVIOR'
@@ -131,32 +131,70 @@ class RuntimeCoordinator(object):
             follow=constraints.first('FOLLOW')
             lead=next((t for t in p.targets if follow is not None and t.id==follow.identifier),None)
             free=speed_policy.desired_speed(p,self.settings)
-            if lead is None or math.hypot(lead.vx,lead.vy)+self.settings.slow_lead_min_advantage_mps>=free or output.stop_distance>=0:
-                self._slow_elapsed=0.0; self._slow_id=None
+            desired=env.desired_lane_id
+            blockage=constraints.blockage_candidates
+            if desired is not None and desired!=p.lane.lane_id:
+                purpose,identifier='MERGE',None
+            elif blockage:
+                identifier=min(blockage,key=lambda v:(v[1],v[0]))[0]
+                lead=next((t for t in p.targets if t.id==identifier),None)
+                purpose='AVOID'
+            elif (lead is not None and math.hypot(lead.vx,lead.vy)+self.settings.slow_lead_min_advantage_mps<free
+                  and output.stop_distance<0):
+                purpose,identifier='OVERTAKE',lead.id
+            else:
+                self._slow_elapsed=0.0;self._slow_id=None
                 return
-            if self._slow_id!=lead.id or dt<0 or dt>0.5:
-                self._slow_id=lead.id; self._slow_elapsed=0.0
-            elif distinct:
-                self._slow_elapsed+=dt
-            if self._slow_elapsed<self.settings.slow_lead_confirmation_s:
-                return
-            candidates=[v for v in env.lanes if v.lane_id!=p.lane.lane_id and self._safe(p,frame,v.lane_id)]
+            if purpose=='OVERTAKE':
+                if self._slow_id!=lead.id or dt<0 or dt>0.5:
+                    self._slow_id=lead.id;self._slow_elapsed=0.0
+                elif distinct:self._slow_elapsed+=dt
+                if self._slow_elapsed<self.settings.slow_lead_confirmation_s:return
+            candidates=[v for v in env.lanes if v.lane_id!=p.lane.lane_id and self._safe(p,frame,v.lane_id)
+                        and (purpose!='MERGE' or v.lane_id==desired)]
             if not candidates:
                 self.reason='NO_LEGAL_SAFE_NEIGHBOR_WITH_COVERAGE'
                 return
             self.origin_lane_id=p.lane.lane_id
-            self.selected_lane_id=min(candidates,key=lambda v:v.lane_id).lane_id
-            self.target_id=lead.id
-            self.session.start(frame,'overtake:'+str(lead.id),'OVERTAKE','PREPARE_OUT',
-                self._goal(p,self.selected_lane_id),('LANE_CHANGE','PATH','LIGHTS','FEEDBACK'))
-            self._phase(frame,'PREPARE_OUT','PERSISTENT_VERIFIED_SLOW_LEAD')
+            self.selected_lane_id=min(candidates,key=lambda v:(v.lane_id!=desired,v.lane_id)).lane_id
+            self.target_id,self.purpose=identifier,purpose
+            key=purpose.lower()+':'+str(identifier if identifier is not None else desired)
+            self.session.start(frame,key,purpose,'PREPARE_OUT',self._goal(p,self.selected_lane_id),
+                ('LANE_CHANGE','PATH','LIGHTS','FEEDBACK'))
+            self._phase(frame,'PREPARE_OUT','VERIFIED_'+purpose+'_OPPORTUNITY')
         lane_id=self.selected_lane_id if 'RETURN' not in self.phase else self.origin_lane_id
         if env.lane(lane_id) is None:
             self.session.tick(frame,p.behavior_capabilities,safety_override=True)
             output.mode='EMERGENCY_BRAKE'; output.target_speed=0.0; output.stop_distance=-1.0
             return
+        dims=getattr(p.behavior_capabilities,'vehicle_geometry',None)
+        source_id=self.selected_lane_id if 'RETURN' in self.phase else self.origin_lane_id
+        source_lane=env.lane(source_id)
+        body=vehicle_footprint(GoalPose(p.ego.x,p.ego.y,p.ego.heading),dims['front_offset_m'],dims['rear_offset_m'],dims['half_width_m']) if dims else None
+        before_cross=source_lane is not None and body is not None and source_lane.contains(body)
+        safe=self._safe(p,frame,lane_id)
+        lead=next((t for t in p.targets if t.id==self.target_id),None)
+        purpose_exists=(self.purpose!='OVERTAKE' or lead is not None and math.hypot(lead.vx,lead.vy)+self.settings.slow_lead_min_advantage_mps
+                        <speed_policy.desired_speed(p,self.settings))
+        if ('RETURN' not in self.phase and self.phase!='PASS' and before_cross
+                and (not safe or not purpose_exists)):
+            self.session.finish(frame,False,'OPPORTUNITY_WITHDRAWN_BEFORE_CROSSING')
+            self._phase(frame,'IDLE','OPPORTUNITY_WITHDRAWN_BEFORE_CROSSING')
+            self._slow_elapsed=0.0
+            return
+        if self.phase.startswith('EXECUTE') and not safe:
+            self.session.block(frame,'EXECUTION_GAP_CHANGED_RECOVERY_REQUIRED')
+            self.reason='EXECUTION_GAP_CHANGED_RECOVERY_REQUIRED'
+            output.mode='EMERGENCY_BRAKE';output.target_speed=0.0;output.stop_distance=-1.0
+            return
+        if (self.session.status=='BLOCKED' and self.session.reason_code=='EXECUTION_GAP_CHANGED_RECOVERY_REQUIRED'
+                and safe and distinct and self.session.retry_after_evidence(frame,'FRESH_GAP_RECOVERY_REEVALUATE')):
+            phase='EVALUATE_RETURN' if 'RETURN' in self.phase else 'EVALUATE_OUT'
+            self._reference=None
+            self.session.advance(frame,phase,self._goal(p,lane_id))
+            self._phase(frame,phase,'FRESH_GAP_RECOVERY_REEVALUATE')
         goal=self._goal(p,lane_id,lights=self.phase!='PASS')
-        self.session.start(frame,self.session.key,'OVERTAKE',self.session.stage,goal,
+        self.session.start(frame,self.session.key,self.purpose,self.session.stage,goal,
                            ('LANE_CHANGE','PATH','LIGHTS','FEEDBACK'))
         reply=None
         replies=sorted(p.behavior_feedback, key=lambda v: (
@@ -204,6 +242,10 @@ class RuntimeCoordinator(object):
                     self.session.finish(frame,True,'OVERTAKE_AND_TASK_ROUTE_RETURN_CONFIRMED')
                     self._phase(frame,'COMPLETE','WHOLE_BODY_SETTLED_ON_TASK_ROUTE')
                     return
+                if self.purpose=='MERGE':
+                    self.session.finish(frame,True,'TASK_REQUIRED_LANE_ACTUALLY_REACHED')
+                    self._phase(frame,'COMPLETE','TASK_REQUIRED_LANE_ACTUALLY_REACHED')
+                    return
                 self._phase(frame,'PASS','WHOLE_BODY_SETTLED_IN_PASSING_CORRIDOR')
         elif self.phase=='PASS':
             lead=next((t for t in p.targets if t.id==self.target_id),None)
@@ -212,7 +254,7 @@ class RuntimeCoordinator(object):
             b=project_polyline(origin.center_line,lead.x,lead.y) if origin and lead else None
             dims=getattr(p.behavior_capabilities,'vehicle_geometry',None)
             passed=(a is not None and b is not None and dims is not None
-                    and a['s']-dims['rear_offset_m']>b['s']+lead.length/2+self.settings.min_gap)
+                    and a['s']-dims['rear_offset_m']>b['s']+lead.length/2+(self.settings.min_gap if self.purpose=='OVERTAKE' else self.settings.obstacle_stop_margin))
             if passed:
                 if env.return_lane_id==self.origin_lane_id:
                     self._settled=0
@@ -226,7 +268,7 @@ class RuntimeCoordinator(object):
         authorization=('PREPARE' if self.phase.startswith('PREPARE') else
                        'EVALUATE_ONLY' if self.phase.startswith('EVALUATE') else 'EXECUTE_SELECTED')
         snapshot=self.session.snapshot(frame)
-        output.behavior_request=RuntimeRequest(frame,snapshot.intent_id,'OVERTAKE',stage,
+        output.behavior_request=RuntimeRequest(frame,snapshot.intent_id,self.purpose,stage,
             snapshot.revision,snapshot.source_frame_id,self.session.goal,authorization,self._reference if authorization=='EXECUTE_SELECTED' else None,
             self.origin_lane_id if 'RETURN' not in self.phase else self.selected_lane_id,
             [c.source+':'+str(c.identifier) for c in constraints.items],self.target_id,
