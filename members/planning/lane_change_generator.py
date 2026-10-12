@@ -84,14 +84,14 @@ class _Work(object):
         if self.count > self.budget.max_checks or time.monotonic() >= self.budget.deadline_monotonic_s:
             raise _Failure('BUDGET_EXHAUSTED', 'inconclusive')
 
-    def validate(self, points, vehicle, limits, region, objects, direction=1):
+    def validate(self, points, vehicle, limits, region, objects, direction=1, execution_envelope=None):
         self.step()
         remaining = self.budget.max_checks - self.count
         if remaining <= 0:
             raise _Failure('BUDGET_EXHAUSTED', 'inconclusive')
         budget = ValidationBudget(remaining, self.budget.max_depth,
                                   self.budget.min_interval_s, self.budget.deadline_monotonic_s)
-        result = validate_candidate(points, direction, vehicle, limits, region, objects, budget)
+        result = validate_candidate(points, direction, vehicle, limits, region, objects, budget, execution_envelope)
         self.count += result['checks']
         if result['reason_code'] == 'BUDGET_EXHAUSTED':
             return result
@@ -122,8 +122,8 @@ def _motion_parameters(start, speed, curvature, cap, vehicle, limits, budget,all
              'VALIDATION_BUDGET_INVALID')
 
 
-def _parameters(start, speed, curvature, cap, vehicle, limits, search, budget):
-    _motion_parameters(start,speed,curvature,cap,vehicle,limits,budget)
+def _parameters(start, speed, curvature, cap, vehicle, limits, search, budget, allow_initial_overspeed=False):
+    _motion_parameters(start,speed,curvature,cap,vehicle,limits,budget,allow_initial_overspeed)
     _require(isinstance(search, LaneChangeSearch), 'LANE_CHANGE_SEARCH_UNAVAILABLE')
     for values in (search.distances_m, search.tangent_scales, search.speed_scales):
         _require(isinstance(values, (list, tuple)) and 1 <= len(values) <= 8
@@ -296,17 +296,20 @@ def _timed(shape, lengths, initial, desired, cap, curvature, vehicle, limits, wo
 def generate_lane_change(start_pose, initial_speed_mps, initial_curvature_m_inv,
                          target_reference, speed_cap_mps, vehicle, limits,
                          crossing_corridor, coverage, obstacles, search, budget,
-                         target_corridor, fixed_goal_pose=None):
+                         target_corridor, fixed_goal_pose=None, execution_envelope=None,
+                         dynamic_search=None):
     """Generate a crossing only with the original source-bound corridor."""
     return _generate_lane_connector(start_pose,initial_speed_mps,initial_curvature_m_inv,
         target_reference,speed_cap_mps,vehicle,limits,crossing_corridor,coverage,obstacles,
-        search,budget,target_corridor,fixed_goal_pose)
+        search,budget,target_corridor,fixed_goal_pose,execution_envelope=execution_envelope,
+        dynamic_search=dynamic_search)
 
 
 def _generate_lane_connector(start_pose, initial_speed_mps, initial_curvature_m_inv,
                              target_reference, speed_cap_mps, vehicle, limits,
                              crossing_corridor, coverage, obstacles, search, budget,
-                             target_corridor, fixed_goal_pose=None, current_target_only=False):
+                             target_corridor, fixed_goal_pose=None, current_target_only=False,
+                             execution_envelope=None,dynamic_search=None):
     """Return the first certified candidate in explicit deterministic order.
 
     Independent sweeps and target-body containment share one budget/deadline. An output is
@@ -316,11 +319,12 @@ def _generate_lane_connector(start_pose, initial_speed_mps, initial_curvature_m_
     report = dict(status='invalid', reason_code='INVALID_INPUT', points=[],
                   attempts=[], checks=0, motion_direction=1,
                   path_scope='current_target_lane' if current_target_only else 'source_bound_crossing',
-                  authority='nominal_candidate_only')
+                  authority='nominal_candidate_only',execution_robust=False,nodes=0)
+    started=time.monotonic()
     work = None
     try:
         _parameters(start_pose, initial_speed_mps, initial_curvature_m_inv, speed_cap_mps,
-                    vehicle, limits, search, budget)
+                    vehicle, limits, search, budget,execution_envelope is not None)
         work = _Work(budget); work.step()
         if current_target_only:
             _require(crossing_corridor is target_corridor and isinstance(target_corridor,CorridorRegion)
@@ -328,7 +332,8 @@ def _generate_lane_connector(start_pose, initial_speed_mps, initial_curvature_m_
             # Geometry-only probe. Neither a stationary execution observation
             # nor a substitute for the actual starting speed/curvature below.
             probe=[TrajectoryPoint(start_pose[0],start_pose[1],0.,start_pose[2],at) for at in (0.,1.)]
-            body=work.validate(probe,vehicle,limits,target_corridor,[])
+            body=work.validate(probe,vehicle,limits,target_corridor,[],
+                               execution_envelope=execution_envelope)
             report['current_body_report']=body
             if body['status']!='safe':
                 report.update(status=body['status'],reason_code=('CURRENT_TARGET_BODY_OUTSIDE'
@@ -356,12 +361,34 @@ def _generate_lane_connector(start_pose, initial_speed_mps, initial_curvature_m_
                     try:
                         goal = tuple(fixed_goal_pose) if fixed_goal_pose is not None else _goal(reference, stations, origin+distance, work)
                         shape, lengths = _shape(start_pose, goal, initial_curvature_m_inv, scale, search, work)
-                        points = _timed(shape, lengths, initial_speed_mps, speed_cap_mps*speed_scale,
-                                        speed_cap_mps, initial_curvature_m_inv, vehicle, limits, work)
-                        legal = work.validate(points, vehicle, limits, crossing_corridor, obstacles)
+                        if execution_envelope is not None:
+                            from members.planning.dynamic_speed import solve_dynamic_speed
+                            remaining=work.budget.max_checks-work.count
+                            if remaining<=0: raise _Failure('BUDGET_EXHAUSTED','inconclusive')
+                            dynamic_budget=ValidationBudget(remaining,work.budget.max_depth,
+                                work.budget.min_interval_s,work.budget.deadline_monotonic_s)
+                            dynamic=solve_dynamic_speed(shape,initial_speed_mps,speed_cap_mps*speed_scale,
+                                vehicle,limits,crossing_corridor,coverage,obstacles,dynamic_budget,
+                                execution_envelope,dynamic_search)
+                            work.count+=dynamic['checks']; report['nodes']+=dynamic['nodes']
+                            attempt['dynamic_report']=dynamic
+                            if dynamic['status']!='safe':
+                                raise _Failure(dynamic['reason_code'],dynamic['status'])
+                            points=dynamic['points']
+                            first_steer=math.atan(vehicle.wheelbase_m*normalize_angle(points[1].heading-points[0].heading)/
+                                math.hypot(points[1].x-points[0].x,points[1].y-points[0].y))
+                            _require(abs(first_steer-math.atan(vehicle.wheelbase_m*initial_curvature_m_inv))/
+                                (points[1].relative_time*.5)<=limits.max_steer_rate_rad_s+EPS,
+                                'INITIAL_STEERING_RATE_LIMIT')
+                            legal=dynamic['legal_report']
+                        else:
+                            points = _timed(shape, lengths, initial_speed_mps, speed_cap_mps*speed_scale,
+                                            speed_cap_mps, initial_curvature_m_inv, vehicle, limits, work)
+                            legal = work.validate(points, vehicle, limits, crossing_corridor, obstacles)
                         attempt['legal_report'] = legal
                         if legal['status'] == 'safe':
-                            visible = work.validate(points, vehicle, limits, coverage, [])
+                            visible = (dynamic['visibility_report'] if execution_envelope is not None else
+                                       work.validate(points, vehicle, limits, coverage, []))
                             attempt['visibility_report'] = visible
                             if visible['status'] == 'safe':
                                 # Geometry-only stationary probe, never inserted
@@ -370,7 +397,8 @@ def _generate_lane_connector(start_pose, initial_speed_mps, initial_curvature_m_
                                 end = points[-1]
                                 probe = [TrajectoryPoint(end.x,end.y,0.,end.heading,0.),
                                          TrajectoryPoint(end.x,end.y,0.,end.heading,1.)]
-                                target_body = work.validate(probe,vehicle,limits,target_corridor,[])
+                                target_body = work.validate(probe,vehicle,limits,target_corridor,[],
+                                                            execution_envelope=execution_envelope)
                                 attempt['target_pose_report'] = target_body
                                 if target_body['status'] == 'safe':
                                     work.step()
@@ -378,7 +406,10 @@ def _generate_lane_connector(start_pose, initial_speed_mps, initial_curvature_m_
                                         if current_target_only else 'NOMINAL_LANE_CHANGE_CANDIDATE_READY'),
                                                   points=points, target_pose=goal, path_distance_m=sum(lengths),
                                                   legal_report=legal, visibility_report=visible,
-                                                  target_pose_report=target_body)
+                                                  target_pose_report=target_body,
+                                                  execution_robust=execution_envelope is not None,
+                                                  authority=('bounded_execution_candidate_only'
+                                                    if execution_envelope is not None else 'nominal_candidate_only'))
                                     report['attempts'].append(attempt)
                                     return report
                                 result = target_body
@@ -405,6 +436,7 @@ def _generate_lane_connector(start_pose, initial_speed_mps, initial_curvature_m_
         report.update(status='invalid', reason_code='INVALID_INPUT', details=str(error), points=[])
     finally:
         report['checks'] = work.count if work else 0
+        report['elapsed_s']=time.monotonic()-started
     return report
 
 
@@ -412,7 +444,8 @@ def plan_lane_change_candidate(perception, target_lane_id, initial_curvature_m_i
                                speed_cap_mps, vehicle, limits, search, budget,
                                prediction_envelopes, clock=None, geometry_cache=None,
                                source_lane_id=None, fixed_goal_pose=None,
-                               allow_target_lane_continuation=False):
+                               allow_target_lane_continuation=False,
+                               execution_envelope=None,dynamic_search=None):
     """Use formal current perception; preserve original Sensor age/deadlines.
 
     Per-object PredictionEnvelope values are explicit and cover the original
@@ -458,6 +491,8 @@ def plan_lane_change_candidate(perception, target_lane_id, initial_curvature_m_i
             min(budget.deadline_monotonic_s, time.monotonic()+scene['source_valid_until_s']-clock()))
         generator=_generate_lane_connector if current_target_only else generate_lane_change
         options={'current_target_only':True} if current_target_only else {}
+        if execution_envelope is not None:
+            options.update(execution_envelope=execution_envelope,dynamic_search=dynamic_search)
         result = generator((perception.ego.x, perception.ego.y, perception.ego.heading),
             perception.ego.speed, initial_curvature_m_inv, target['center_line'], speed_cap_mps,
             vehicle, limits, target_region if current_target_only else scene['legal_crossing_corridor'],
@@ -478,7 +513,7 @@ def plan_lane_change_candidate(perception, target_lane_id, initial_curvature_m_i
                                       effective.deadline_monotonic_s)
             crossing=plan_lane_change_candidate(perception,target_lane_id,initial_curvature_m_inv,
                 speed_cap_mps,vehicle,limits,search,fallback,prediction_envelopes,clock,geometry_cache,
-                source_lane_id,fixed_goal_pose)
+                source_lane_id,fixed_goal_pose,execution_envelope=execution_envelope,dynamic_search=dynamic_search)
             crossing['checks']=crossing.get('checks',0)+result['checks']
             crossing['current_body_report']=result['current_body_report']
             return crossing

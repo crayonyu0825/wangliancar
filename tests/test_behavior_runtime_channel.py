@@ -103,17 +103,22 @@ class BehaviorRuntimeTests(unittest.TestCase):
         self.now += .25
         with self.assertRaises(ValueError): read_channel(p,self.now)
 
-    def test_task_and_frame_rollback_reset_feedback_scope(self):
+    def test_task_and_frame_rollback_preserve_scope_until_captain_reset(self):
         p = self.frame(10,x=26.2)
         self.pipeline(p)
         old = p.behavior_channel["context"]
         self.now += .05
         rolled = self.frame(1,x=26.2)
-        self.assertNotEqual(old,rolled.behavior_channel["context"])
-        self.assertFalse(rolled.behavior_channel["feedbacks"])
+        self.assertFalse(rolled.behavior_channel)
+        self.assertEqual(old,self.transport.context.to_dict())
         rolled.task_id = "different"
         self.transport.prepare(rolled)
+        self.assertFalse(rolled.behavior_channel)
+        self.assertEqual(old,self.transport.context.to_dict())
+        self.transport.reset_session()
+        self.transport.prepare(rolled)
         self.assertNotEqual(old,rolled.behavior_channel["context"])
+        self.assertFalse(rolled.behavior_channel["feedbacks"])
 
     def test_lost_or_disabled_channel_cannot_erase_unfinished_signal_obligation(self):
         for change in ("missing","disabled","bad_context","diagnostic_error"):

@@ -96,13 +96,13 @@ class GoalPose(object):
 class BehaviorGoal(object):
     __slots__ = ("target_lane_id", "parking_space_id", "goal_pose", "motion_direction",
                  "speed_cap_mps", "stop_distance_m", "precision_stop",
-                 "minimum_standstill_duration_s", "parking_brake_at_stop", "light_intent", "stop_obligation_id", "source_lane_id")
+                 "minimum_standstill_duration_s", "parking_brake_at_stop", "light_intent", "stop_obligation_id", "source_lane_id", "candidate_id")
 
     def __init__(self, target_lane_id=None, parking_space_id=None, goal_pose=None,
                  motion_direction=1, speed_cap_mps=0.0, stop_distance_m=-1.0,
                  precision_stop=False, minimum_standstill_duration_s=0.0,
                  parking_brake_at_stop=False, light_intent=None, stop_obligation_id=None,
-                 source_lane_id=None):
+                 source_lane_id=None, candidate_id=None):
         require(target_lane_id is None or isinstance(target_lane_id, str), "invalid target lane")
         require(source_lane_id is None or isinstance(source_lane_id,str) and bool(source_lane_id),
                 "invalid original source lane")
@@ -119,6 +119,8 @@ class BehaviorGoal(object):
                 "invalid stop flags")
         self.target_lane_id, self.parking_space_id, self.goal_pose = target_lane_id, parking_space_id, goal_pose
         self.source_lane_id=source_lane_id
+        require(candidate_id is None or isinstance(candidate_id,str) and bool(candidate_id), 'invalid selected candidate ID')
+        self.candidate_id=candidate_id
         self.motion_direction, self.speed_cap_mps = motion_direction, speed_cap_mps
         self.stop_distance_m, self.precision_stop = stop_distance_m, precision_stop
         self.minimum_standstill_duration_s = minimum_standstill_duration_s
@@ -139,6 +141,8 @@ class BehaviorGoal(object):
         # Optional v1 extension: old forward/stop payloads keep their schema.
         if self.source_lane_id is not None:
             result['source_lane_id']=self.source_lane_id
+        if self.candidate_id is not None:
+            result['candidate_id']=self.candidate_id
         return result
 
 
@@ -197,7 +201,10 @@ class ExecutionFeedback(object):
                  "produced_frame_id", "produced_at_s", "valid_until_s", "clock_id", "usable",
                  "status", "reason_code", "retryable", "progress", "actual_standstill_confirmed",
                  "goal_pose_arrived", "standstill_duration_s", "hold_completed", "lights_confirmed",
-                 "motion_direction", "actual_pose", "actual_lane_id", "lights_duration_s", "candidate_id")
+                 "motion_direction", "actual_pose", "actual_lane_id", "lights_duration_s", "candidate_id",
+                 "lights_command_duration_s", "lights_evidence_level", "candidate_options",
+                 "planning_metrics", "evidence_level", "command_send_status", "gear_confirmed",
+                 "actual_brake_stop_confirmed")
 
     def __init__(self, context, intent_id, stage, revision, producer, source_frame_id,
                  produced_frame_id, produced_at_s, valid_until_s, status,
@@ -205,7 +212,10 @@ class ExecutionFeedback(object):
                  actual_standstill_confirmed=False, goal_pose_arrived=False,
                  standstill_duration_s=0.0, hold_completed=False, lights_confirmed=False,
                  motion_direction=1, actual_pose=None, clock_id="process_monotonic",
-                 actual_lane_id=None, lights_duration_s=0.0, candidate_id=None):
+                 actual_lane_id=None, lights_duration_s=0.0, candidate_id=None,
+                 lights_command_duration_s=0., lights_evidence_level=None, candidate_options=None,
+                 planning_metrics=None, evidence_level="unknown", command_send_status="unknown", gear_confirmed=None,
+                 actual_brake_stop_confirmed=False):
         self.context, self.intent_id, self.stage, self.revision = context, intent_id, stage, revision
         self.producer, self.source_frame_id, self.produced_frame_id = producer, source_frame_id, produced_frame_id
         self.produced_at_s, self.valid_until_s, self.clock_id = produced_at_s, valid_until_s, clock_id
@@ -216,6 +226,15 @@ class ExecutionFeedback(object):
         self.lights_confirmed, self.motion_direction, self.actual_pose = lights_confirmed, motion_direction, actual_pose
         self.actual_lane_id, self.lights_duration_s = actual_lane_id, lights_duration_s
         self.candidate_id = candidate_id
+        self.lights_command_duration_s = lights_command_duration_s
+        self.lights_evidence_level = ("sensor_confirmed" if lights_confirmed else "unknown") if lights_evidence_level is None else lights_evidence_level
+        self.candidate_options = [] if candidate_options is None else candidate_options
+        self.planning_metrics = {} if planning_metrics is None else planning_metrics
+        self.evidence_level, self.command_send_status = evidence_level, command_send_status
+        self.gear_confirmed = gear_confirmed
+        # Safe measured braking outcome; it does not imply the requested pose
+        # was reached or that a lateral maneuver was completed.
+        self.actual_brake_stop_confirmed=actual_brake_stop_confirmed
 
 
 class FeedbackValidator(object):
@@ -254,7 +273,8 @@ class FeedbackValidator(object):
                 or frame.observed_at_s - feedback.produced_at_s > self.max_age_s):
             return False, "FEEDBACK_TIME", False
         flags = (feedback.usable, feedback.retryable, feedback.actual_standstill_confirmed,
-                 feedback.goal_pose_arrived, feedback.hold_completed, feedback.lights_confirmed)
+                 feedback.goal_pose_arrived, feedback.hold_completed, feedback.lights_confirmed,
+                 feedback.actual_brake_stop_confirmed)
         if (any(type(v) is not bool for v in flags) or not feedback.usable
                 or not finite(feedback.progress) or not 0 <= feedback.progress <= 1
                 or not finite(feedback.standstill_duration_s) or feedback.standstill_duration_s < 0
@@ -267,6 +287,31 @@ class FeedbackValidator(object):
                 or not isinstance(feedback.reason_code, str)
                 or (feedback.candidate_id is not None and not isinstance(feedback.candidate_id, str))):
             return False, "FEEDBACK_VALUES", False
+        if (not finite(feedback.lights_command_duration_s) or feedback.lights_command_duration_s < 0
+                or feedback.lights_evidence_level not in ("unknown", "command_sent", "sensor_confirmed")
+                or feedback.command_send_status not in ("unknown", "not_attempted", "sent", "failed")
+                or not isinstance(feedback.evidence_level, str)
+                or (feedback.gear_confirmed is not None and type(feedback.gear_confirmed) is not bool)
+                or feedback.lights_confirmed and feedback.lights_evidence_level != "sensor_confirmed"
+                or not isinstance(feedback.planning_metrics, dict)
+                or not isinstance(feedback.candidate_options, list) or len(feedback.candidate_options) > 8):
+            return False, "FEEDBACK_EVIDENCE_VALUES", False
+        if feedback.actual_brake_stop_confirmed and not (
+                request.maneuver=='EMERGENCY' and request.stage in ('BRAKE_FALLBACK',
+                    'EXECUTE_BRAKE','EXECUTE_LEFT','EXECUTE_RIGHT','EXECUTE_BRAKE_LEFT','EXECUTE_BRAKE_RIGHT')
+                and feedback.producer=='runtime' and feedback.command_send_status=='sent'
+                and feedback.actual_standstill_confirmed and feedback.actual_pose is not None
+                and feedback.candidate_id==request.goal.candidate_id
+                and feedback.status not in ('FAILED','REJECTED')
+                and feedback.evidence_level=='verified_actual_brake_stop'):
+            return False,'FEEDBACK_BRAKE_STOP_EVIDENCE',False
+        try:
+            for option in feedback.candidate_options:
+                validate_candidate_option(option, feedback.valid_until_s)
+                require(not option['feasible'] or frame.observed_at_s < option['source_valid_until_s'],
+                        'CANDIDATE_OPTION_EXPIRED')
+        except (ValueError, TypeError, KeyError):
+            return False, "FEEDBACK_CANDIDATE_OPTIONS", False
         key = (feedback.producer, feedback.intent_id, feedback.stage, feedback.revision)
         sequence = (feedback.produced_frame_id, feedback.produced_at_s)
         previous = self._last.get(key)
@@ -278,3 +323,42 @@ class FeedbackValidator(object):
             if len(self._last) > 128:
                 self._last = {key: sequence}
         return True, "FEEDBACK_VALID" if distinct else "FEEDBACK_DUPLICATE", distinct
+
+
+def validate_candidate_option(option, deadline):
+    """A bounded proposal tied to the original request; never execution proof."""
+    required = {"candidate_id", "action", "goal", "feasible", "risk_cost", "rule_cost",
+                "validation_reason", "source_valid_until_s", "segment_id", "segment_count"}
+    require(isinstance(option, dict) and set(option) == required, 'CANDIDATE_OPTION_SCHEMA')
+    require(all(isinstance(option[k], str) and bool(option[k]) for k in
+                ('candidate_id', 'action', 'validation_reason', 'segment_id')), 'CANDIDATE_OPTION_IDENTITY')
+    require(type(option['feasible']) is bool and type(option['segment_count']) is int
+            and 1 <= option['segment_count'] <= 128, 'CANDIDATE_OPTION_VALUES')
+    require(all(finite(option[k]) and option[k] >= 0 for k in ('risk_cost', 'rule_cost'))
+            and finite(option['source_valid_until_s'])
+            and option['source_valid_until_s'] <= deadline, 'CANDIDATE_OPTION_TIME_OR_RISK')
+    goal = option['goal']
+    require(isinstance(goal, dict), 'CANDIDATE_OPTION_GOAL')
+    data = dict(goal)
+    pose, lights = data.pop('goal_pose', None), data.pop('light_intent', None)
+    if pose is not None:
+        require(isinstance(pose, dict) and set(pose) == {'x', 'y', 'body_heading_rad', 'reference_point'}
+                and pose['reference_point'] == 'ego_rear_axle', 'CANDIDATE_OPTION_POSE')
+        data['goal_pose'] = GoalPose(pose['x'], pose['y'], pose['body_heading_rad'])
+    if lights is not None:
+        data['light_intent'] = LightIntent(**lights)
+    BehaviorGoal(**data)
+    return option
+
+
+def goal_from_dict(value):
+    require(isinstance(value,dict),'BEHAVIOR_GOAL_INVALID')
+    data=dict(value)
+    pose=data.pop('goal_pose',None)
+    lights=data.pop('light_intent',None)
+    if pose is not None:
+        require(isinstance(pose,dict) and set(pose)=={'x','y','body_heading_rad','reference_point'}
+                and pose['reference_point']=='ego_rear_axle','BEHAVIOR_GOAL_REFERENCE_INVALID')
+        data['goal_pose']=GoalPose(pose['x'],pose['y'],pose['body_heading_rad'])
+    if lights is not None: data['light_intent']=LightIntent(**lights)
+    return BehaviorGoal(**data)

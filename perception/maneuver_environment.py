@@ -24,6 +24,8 @@ def _observed_objects(perception):
     if (not perception.targets_valid or not isinstance(meta,dict) or meta.get("usable") is not True
             or not isinstance(source,str) or not source.startswith("sensor:") or not source[7:]):
         return [],False,"formal_targets_unavailable"
+    if meta.get('motion_fields_complete') is False:
+        return [],False,'formal_target_velocity_source_unknown'
     objects,ids,complete = [],set(),True
     for target in perception.targets:
         fields = (target.x,target.y,target.z,target.vx,target.vy,target.length,target.width)
@@ -199,8 +201,19 @@ class ManeuverEnvironmentBuilder(object):
                 env.junctions = []
                 env.road_regions = []
         self._roads(perception,env,complete,coverage,query)
+        from perception.route_environment import publish_route
+        publish_route(perception,env,self.route_manager,coverage,query,_evidence,clock=self.clock)
         self._parking(perception,env,complete,coverage,query)
         self._crossings(perception,env,complete,coverage,query)
+        if env.junctions or getattr(getattr(self.route_manager,'_maneuver_map',None),'passage_sources',None):
+            from perception.passage_environment import publish_passages
+            try:
+                publish_passages(perception,env,self.route_manager,coverage,query,_evidence)
+            except (ValueError,TypeError,KeyError,AttributeError,IndexError,OverflowError) as error:
+                for item in env.junctions:
+                    item.update(corridor_geometry_verified=False,conflict_coverage_complete=False,
+                                exit_coverage_verified=False,exit_occupancy='unknown',
+                                corridor_geometry_reason='PASSAGE_SOURCE_FAILED:'+str(error))
         if query is not None:
             env.status['coverage'].update(query_checks=query.checks,query_reason=query.reason)
         # A lengthy map/geometry query must not publish renewed clear regions.
@@ -217,6 +230,10 @@ class ManeuverEnvironmentBuilder(object):
                 if item.get('occupancy') in ('clear','empty'): item['occupancy']='unknown'
                 if 'occupancy_verified' in item and item.get('occupancy')=='unknown': item['occupancy_verified']=False
                 if isinstance(item.get('evidence'),dict): item['evidence']['coverage_verified']=False
+            for item in env.junctions:
+                item.update(conflict_coverage_complete=False,exit_coverage_verified=False,exit_occupancy='unknown')
+                if isinstance(item.get('dynamic_evidence'),dict):
+                    item['dynamic_evidence']['coverage_verified']=False
         return env
 
     def _roads(self,p,env,complete,coverage,query):

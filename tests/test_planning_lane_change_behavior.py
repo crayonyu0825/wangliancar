@@ -10,6 +10,7 @@ from core.interfaces import DecisionTarget,DecisionMode,Trajectory,TrajectoryPoi
 from core.validation import validate_output
 from core.serialization import to_dict
 from core.behavior_contract import GoalPose,Capabilities
+from core.behavior_evidence import Evidence
 from core.safety_supervisor import SafetySupervisor
 from types import SimpleNamespace as NS
 from members import planning_stub,control_stub
@@ -25,6 +26,9 @@ from tests.test_planning_lane_change_generator import search
 from tests.control_benchmark import vehicle as control_vehicle
 from tests.test_control_maneuvers import BidirectionalPlant
 from tests.test_maneuver_perception import target
+from lane_change_integration import LaneChangeInputBridge,LaneChangeIntegrationInputs
+from members.decision.behaviors.lane_change_runtime import LaneChangeDecisionInputs
+from members.planning.candidate_validation import ExecutionEnvelope
 
 
 SOURCE,TARGET=decision_fixture.SOURCE,decision_fixture.TARGET
@@ -102,6 +106,24 @@ class PlanningLaneChangeBehaviorTests(unittest.TestCase):
         self.assertIn(reason,t.reason)
         return t
 
+    def monitored_supervisor(self):
+        # This legacy component fixture supplies an explicit zero-error authored
+        # candidate model. It does not arm execution monitoring or certify a car.
+        def paired(p,context):
+            e=Evidence(context,p.frame_id,self.f.now,p.valid_until,True,True,
+                       'legacy-authored-component-model',source_kind='task')
+            d=LaneChangeDecisionInputs(e,e,'synthetic-bicycle-and-empty-object-model-v1',
+                'legacy-authored-lane-task',SOURCE,(3.9,.9,.9),3.)
+            m=self.inputs(p,context); m.execution_envelope=ExecutionEnvelope(0.,0.,0.,0.)
+            m.speed_error_mps=.5
+            return LaneChangeIntegrationInputs(d,m,budget(max_checks=1000000))
+        bridge=LaneChangeInputBridge(paired,self.f.clock); bridge.settings=self.settings
+        def assess(p,d,t,c):
+            bridge.prepare(p)
+            return bridge.assess(p,d,t,c)
+        return SafetySupervisor(NS(send_control=True),self.f.clock,planning_settings=self.settings,
+                                lane_change_guard=assess)
+
     def test_request_path_ack_stays_in_current_lane_before_execute_without_fault_latch(self):
         r,d,t=self.prepare()
         self.assertEqual('LANE_CHANGE_PATH_PREPARED_WAIT_EXECUTE',t.reason)
@@ -109,7 +131,7 @@ class PlanningLaneChangeBehaviorTests(unittest.TestCase):
         self.assertEqual(r.intent_id,self.transport.feedbacks[0]['intent_id'])
         c=control_stub.compute_control(self.f.p,t)
         self.assertTrue(c.valid,c.errors)
-        supervisor=SafetySupervisor(NS(send_control=True),self.f.clock,planning_settings=self.settings)
+        supervisor=self.monitored_supervisor()
         safety=supervisor.evaluate(self.f.p,d,t,c)
         self.assertFalse(safety.active,safety.reason)
 
@@ -143,11 +165,21 @@ class PlanningLaneChangeBehaviorTests(unittest.TestCase):
         self.reject(self.decision(self.request_path()),'SOURCE_READ_FAILED')
         self.assertEqual((),BehaviorTransport().actions)
 
-    def test_prepare_gap_and_terminal_stages_cannot_dispatch_a_path(self):
+    def test_preparation_stays_current_and_terminal_stages_cannot_dispatch(self):
         r=self.request_path(); payload=r.to_dict('runtime_connected')
-        for stage in ('PREPARE','WAIT_GAP','COMPLETE','RECOVER'):
+        for stage in ('COMPLETE','RECOVER'):
             payload['stage']=stage
             self.reject(self.decision(payload),'LANE_CHANGE_STAGE_NOT_PLANNABLE')
+        for stage in ('PREPARE','WAIT_GAP'):
+            payload['stage']=stage; payload['revision']+=1
+            d=self.decision(payload); d.target_lane_id=SOURCE
+            d.stop_distance=8.; d.precision_stop=True
+            t=planning_stub.plan(self.f.p,d)
+            self.assertTrue(t.valid,t.errors)
+            self.assertIsNone(t.behavior_identity); self.assertIsNone(t.behavior_feedback)
+            self.assertIsNone(t.candidate_id)
+            self.assertTrue(all(abs(v.y)<1e-9 for v in t.points))
+            self.assertLessEqual(t.points[-1].x-self.f.p.ego.x,8.+1e-9)
 
     def test_cold_execute_requires_successful_request_path_for_same_intent(self):
         r=self.request_path(); payload=r.to_dict('runtime_connected'); payload['stage']='EXECUTE'
@@ -279,6 +311,19 @@ class PlanningLaneChangeBehaviorTests(unittest.TestCase):
         self.assertEqual((35.,3.5),(t.points[-1].x,t.points[-1].y))
         self.assertEqual(SOURCE,r.goal.source_lane_id)
 
+    def test_monitor_target_only_continuation_still_checks_actual_body_and_remaining_path(self):
+        r,d,t=self.execute()
+        self.h.advance(25.,3.5,0.,TARGET,1.5)
+        # The original neighbor is genuinely absent in this formal snapshot.
+        # No old crossing certificate is borrowed once the whole body fits B.
+        self.f.p.maneuver_environment.neighbor_lanes=[]
+        r=self.h.policy.session.snapshot(self.h.frame());d=self.decision(r)
+        t=planning_stub.plan(self.f.p,d);self.assertTrue(t.valid,t.errors)
+        c=control_stub.compute_control(self.f.p,t);self.assertTrue(c.valid,c.errors)
+        self.assertFalse(self.monitored_supervisor().evaluate(self.f.p,d,t,c).active)
+        altered=copy.deepcopy(t);altered.points[len(altered.points)//2].y=1.5
+        self.assertTrue(self.monitored_supervisor().evaluate(self.f.p,d,altered,c).active)
+
     def test_actual_map_replacement_with_same_lane_ids_rejects_active_binding(self):
         r,d,t=self.execute(); self.h.producer.restrict('decrease')
         r=self.h.policy.session.snapshot(self.h.frame())
@@ -343,7 +388,7 @@ class PlanningLaneChangeBehaviorTests(unittest.TestCase):
     def assert_continuous_completion(self,withdraw_original=False):
         r,d,t=self.execute(); initial=r.intent_id
         plant=BidirectionalPlant(x=10.,lag=.3); stages=set(); switched=False; withdrawn=False
-        supervisor=SafetySupervisor(NS(send_control=True),self.f.clock,planning_settings=self.settings)
+        supervisor=self.monitored_supervisor()
         for unused in range(700):
             c=control_stub.compute_control(self.f.p,t)
             self.assertTrue(c.valid,c.errors); validate_output(c,ControlOut,t)

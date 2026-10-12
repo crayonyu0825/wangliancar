@@ -58,7 +58,7 @@ class BehaviorSession(object):
         return (goal.target_lane_id, goal.source_lane_id, goal.parking_space_id, pose, goal.motion_direction,
                 goal.precision_stop, goal.minimum_standstill_duration_s,
                 goal.parking_brake_at_stop, tuple(sorted(goal.light_intent.to_dict().items())),
-                goal.stop_obligation_id)
+                goal.stop_obligation_id, goal.candidate_id)
 
     def start(self, frame, key, maneuver, stage, goal, required=()):
         require(isinstance(frame, BehaviorFrame) and isinstance(goal, BehaviorGoal), "invalid intent start")
@@ -147,6 +147,7 @@ class BehaviorSession(object):
                 stop_distance_m=old.stop_distance_m, precision_stop=old.precision_stop,
                 minimum_standstill_duration_s=old.minimum_standstill_duration_s,
                 parking_brake_at_stop=old.parking_brake_at_stop, stop_obligation_id=old.stop_obligation_id,
+                candidate_id=old.candidate_id,
                 light_intent=LightIntent(hazard_signal=old.light_intent.hazard_signal))
         self.status, self.reason_code, self._dispatched = "BLOCKED", reason, False
         self._event(frame, reason)

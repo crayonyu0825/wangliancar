@@ -42,7 +42,7 @@ class EmergencyPolicy(object):
                  execution_feedback=None, verified_task_route_available=False):
         require(type(dangerous) is bool and isinstance(danger_id, str), "invalid emergency fact")
         require(all(isinstance(c, EmergencyCandidate) for c in candidates), "invalid emergency candidates")
-        if not frame.current(frame.observed_at_s) or not isinstance(evidence, Evidence) or not evidence.verified(frame, allowed_source_kinds=("sensor", "verified_fusion", "synthetic")):
+        if not frame.current(frame.observed_at_s) or not isinstance(evidence, Evidence) or not evidence.verified(frame, allowed_source_kinds=("sensor", "verified_fusion", "synthetic", "task")):
             request = self.session.tick(frame, capabilities, safety_override=True) if self.session.intent_id else None
             return EmergencyResult(request, "EMERGENCY_OBSERVATION_UNKNOWN")
         if self._context != frame.context.key():
@@ -64,7 +64,22 @@ class EmergencyPolicy(object):
             # A new danger invalidates candidates even while still selecting.
             self.session.advance(frame, "SELECT", BehaviorGoal(), reason="NEW_DANGER_REPLAN",
                                  force_revision=True)
-        request = self.session.tick(frame, capabilities, execution_feedback)
+        fallback=False
+        if (self.selected is not None and self.session.stage!='BRAKE_FALLBACK'
+                and execution_feedback is not None and execution_feedback.producer=='planning'
+                and execution_feedback.status=='REJECTED'
+                and execution_feedback.candidate_id==self.selected.identifier
+                and execution_feedback.planning_metrics.get('fallback_brake_required') is True):
+            valid,unused,unused2=self.session.validator.check(execution_feedback,self.session.snapshot(frame),frame)
+            fallback=(valid and execution_feedback.producer=='planning' and execution_feedback.status=='REJECTED'
+                and execution_feedback.candidate_id==self.selected.identifier
+                and execution_feedback.planning_metrics.get('fallback_brake_required') is True)
+        if fallback:
+            self.session.advance(frame,'BRAKE_FALLBACK',self.selected.goal,
+                reason='PRIMARY_MOTION_REJECTED_AUTHORIZE_BRAKING_FALLBACK')
+            request=self.session.tick(frame,capabilities)
+        else:
+            request = self.session.tick(frame, capabilities, execution_feedback)
         if dangerous:
             self._clear = 0
             if not request.dispatch_allowed:
@@ -86,16 +101,23 @@ class EmergencyPolicy(object):
                 self.selected = min(feasible, key=lambda c: (c.risk_cost, c.rule_cost, c.action, c.identifier))
                 request = self.session.advance(frame, "EXECUTE_" + self.selected.action,
                                                self.selected.goal, reason="VALIDATED_EMERGENCY_CANDIDATE_SELECTED")
+                request = self.session.tick(frame, capabilities)
             return EmergencyResult(request, request.reason_code, self.session.stage,
                                    None if self.selected is None else self.selected.identifier)
         if distinct:
             self._clear += 1
         reply = self.session.last_feedback
-        executed = (reply is not None and reply.producer in ("control", "runtime")
-                    and reply.progress >= 1.0 and (reply.actual_standstill_confirmed
-                    or reply.goal_pose_arrived and reply.actual_pose is not None))
+        actual_stop=(reply is not None and reply.producer=='runtime'
+            and reply.actual_brake_stop_confirmed and reply.actual_standstill_confirmed
+            and reply.command_send_status=='sent' and self.selected is not None
+            and reply.candidate_id==self.selected.identifier and reply.actual_pose is not None)
+        executed = (actual_stop or reply is not None and reply.producer in ("control", "runtime")
+                    and reply.actual_standstill_confirmed and reply.goal_pose_arrived
+                    and reply.actual_pose is not None)
         if self._clear >= self.clear_frames and executed and verified_task_route_available:
-            request = self.session.finish(frame, True, "DANGER_CLEARED_EXECUTION_VERIFIED_RETURN_TO_TASK")
+            reason=('DANGER_CLEARED_ACTUAL_BRAKE_STOP_RETURN_TO_TASK' if actual_stop
+                    else 'DANGER_CLEARED_EXECUTION_VERIFIED_RETURN_TO_TASK')
+            request = self.session.finish(frame, True, reason)
             result = EmergencyResult(request, request.reason_code, "COMPLETE",
                                      None if self.selected is None else self.selected.identifier)
             result.immediate_brake_required, result.hold_required = False, False

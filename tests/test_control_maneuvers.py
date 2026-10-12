@@ -357,13 +357,14 @@ class ManeuverTests(unittest.TestCase):
         self.assertEqual(0, result.throttle)
         self.assertIn("magnitude disagrees", result.errors[0])
 
-    def test_new_task_discards_previous_parking_dwell(self):
+    def test_explicit_captain_reset_for_new_task_discards_previous_parking_dwell(self):
         plant = BidirectionalPlant()
         p, t = maneuver_input(plant, [(0, 0, 0), (0, 0, 0)], 1, target=0,
                              stop_distance=0, precision=True, dwell=10, parking=True)
         self.assertEqual("DWELL", self.compute(p, t).diagnostics["state"])
         p, t = maneuver_input(plant, [(0, 0, 1), (10, 0, 1)], 2)
         p.task_id = "new task"
+        self.engine.reset()
         result = self.compute(p, t)
         self.assertGreater(result.throttle, 0)
         self.assertFalse(self.engine.standstill.active)

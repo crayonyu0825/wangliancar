@@ -328,6 +328,9 @@ class Trajectory(FrameOutput):
         self.stop_obligation_id = ""
         self.behavior_identity = None
         self.behavior_feedback = None
+        # Stable accepted candidate identity and bounded quantitative feedback.
+        self.candidate_id = None
+        self.planning_metrics = {}
 
 
 class ControlOut(FrameOutput):

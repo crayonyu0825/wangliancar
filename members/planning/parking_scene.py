@@ -16,7 +16,8 @@ from members.planning.candidate_validation import validate_candidate
 
 
 def validate_parking_path(perception,mission,stage,points,motion_direction,vehicle,limits,
-                          budget,prediction_envelopes,clock=None):
+                          budget,prediction_envelopes,clock=None,intermediate_segment=False,
+                          execution_envelope=None):
     """Public current-source recheck for the captain's independent veto.
 
     Reuse P02's nominal swept-body validator, not a new trajectory or an
@@ -28,14 +29,15 @@ def validate_parking_path(perception,mission,stage,points,motion_direction,vehic
     try:
         require(stage in ('APPROACH','POSITION','REVERSE_ENTRY','ALIGN','PARKED_DWELL','EXIT_PREPARE','EXIT'),
                 'PARKING_STAGE_UNSUPPORTED')
-        require(type(motion_direction) is int and motion_direction==(
-            -1 if stage in ('REVERSE_ENTRY','ALIGN','PARKED_DWELL','EXIT_PREPARE') else 1),
+        require(type(motion_direction) is int and motion_direction in (-1,1) and (
+            stage in ('ALIGN','PARKED_DWELL','EXIT_PREPARE') or motion_direction==(
+            -1 if stage=='REVERSE_ENTRY' else 1)),
             'PARKING_STAGE_DIRECTION_MISMATCH')
         require(isinstance(budget,ValidationBudget) and type(budget.max_checks) is int and budget.max_checks>0
                 and number(budget.deadline_monotonic_s) and clock()<budget.deadline_monotonic_s,
                 'PARKING_MONITOR_BUDGET_UNAVAILABLE')
         scene=read_parking_scene(perception,mission.space_id,mission.road_lane_ids,
-            stage in ('REVERSE_ENTRY','ALIGN','PARKED_DWELL'),mission.access_edge_index,clock)
+            None if intermediate_segment else stage in ('REVERSE_ENTRY','ALIGN','PARKED_DWELL'),mission.access_edge_index,clock)
         require(scene['map_digest']==mission.map_digest,'PARKING_MISSION_MAP_MISMATCH')
         predictions=_source_predictions(scene['objects'],prediction_envelopes,clock())
         deadline=min(budget.deadline_monotonic_s,
@@ -44,12 +46,13 @@ def validate_parking_path(perception,mission,stage,points,motion_direction,vehic
             require(report['checks']<budget.max_checks,'PARKING_MONITOR_BUDGET_EXHAUSTED')
             remaining=ValidationBudget(budget.max_checks-report['checks'],budget.max_depth,
                                        budget.min_interval_s,deadline)
-            result=validate_candidate(points,motion_direction,vehicle,limits,region,objects,remaining)
+            result=validate_candidate(points,motion_direction,vehicle,limits,region,objects,remaining,
+                                      execution_envelope=execution_envelope)
             report['checks']+=result['checks']
             report.update(status=result['status'],reason_code=result['reason_code'])
             if result['status']!='safe': return report
         latest=read_parking_scene(perception,mission.space_id,mission.road_lane_ids,
-            stage in ('REVERSE_ENTRY','ALIGN','PARKED_DWELL'),mission.access_edge_index,clock)
+            None if intermediate_segment else stage in ('REVERSE_ENTRY','ALIGN','PARKED_DWELL'),mission.access_edge_index,clock)
         require(all(latest[k]==scene[k] for k in ('bay','roads','objects','map_digest','source_valid_until_s'))
                 and latest['coverage'].polygons==scene['coverage'].polygons,
                 'PARKING_MONITOR_SOURCES_CHANGED_DURING_CHECK')
@@ -63,7 +66,7 @@ def validate_parking_path(perception,mission,stage,points,motion_direction,vehic
 
 
 def read_parking_scene(perception,space_id,road_lane_ids,goal_in_bay,access_edge_index,clock=None,geometry_cache=None):
-    require(type(goal_in_bay) is bool and isinstance(road_lane_ids,(list,tuple))
+    require((type(goal_in_bay) is bool or goal_in_bay is None) and isinstance(road_lane_ids,(list,tuple))
             and 1<=len(road_lane_ids)<=3 and len(set(road_lane_ids))==len(road_lane_ids)
             and all(isinstance(v,str) and v for v in road_lane_ids),'PARKING_ROAD_SET_INVALID')
     require(type(access_edge_index) is int and 0<=access_edge_index<=3,'PARKING_ACCESS_EDGE_UNAVAILABLE')
@@ -84,7 +87,8 @@ def read_parking_scene(perception,space_id,road_lane_ids,goal_in_bay,access_edge
     descriptor=((knots[i],knots[(i+1)%4]),(knots[(i+3)%4],knots[(i+2)%4]),'left',
                 ((encode_position(0,Fraction(0)),encode_position(0,Fraction(1))),))
     polygons=[v['polygon'] for v in roads]+[bay['boundary']]
-    goal_polygons=[bay['boundary']] if goal_in_bay else [v['polygon'] for v in roads]
+    goal_polygons=(polygons if goal_in_bay is None else
+                   [bay['boundary']] if goal_in_bay else [v['polygon'] for v in roads])
     if geometry_cache is None:
         access=CrossingCorridor(tuple(tuple(tuple(p) for p in v) for v in polygons),descriptor,None)
         coverage=CorridorRegion([v['polygon'] for v in views])
@@ -109,7 +113,8 @@ def read_parking_scene(perception,space_id,road_lane_ids,goal_in_bay,access_edge
 
 def plan_parking_candidate(perception,space_id,stage,goal_pose,motion_direction,initial_curvature_m_inv,
                            speed_cap_mps,vehicle,limits,search,budget,prediction_envelopes,
-                           road_lane_ids,access_edge_index,clock=None,geometry_cache=None):
+                           road_lane_ids,access_edge_index,clock=None,geometry_cache=None,
+                           intermediate_segment=False):
     """Generate one stage from formal facts, never advance or change gears.
 
     Requires a known current map/lane and explicit upstream goal/constraints.
@@ -118,8 +123,9 @@ def plan_parking_candidate(perception,space_id,stage,goal_pose,motion_direction,
     clock=clock or time.monotonic
     try:
         _require(stage in ('APPROACH','POSITION','REVERSE_ENTRY','ALIGN','EXIT'),'PARKING_STAGE_UNSUPPORTED')
-        goal_in_bay=stage in ('REVERSE_ENTRY','ALIGN')
-        _require(type(motion_direction) is int and motion_direction==(-1 if goal_in_bay else 1),
+        goal_in_bay=None if intermediate_segment else stage in ('REVERSE_ENTRY','ALIGN')
+        _require(type(motion_direction) is int and motion_direction in (-1,1)
+                 and (stage=='ALIGN' or motion_direction==(-1 if goal_in_bay else 1)),
                  'PARKING_STAGE_DIRECTION_MISMATCH')
         _require(all(number(v) for v in (perception.ego.vx,perception.ego.vy,perception.ego.speed))
                  and not opposes_direction(perception.ego.vx,perception.ego.vy,perception.ego.heading,

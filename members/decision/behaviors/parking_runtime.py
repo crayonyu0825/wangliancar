@@ -148,6 +148,8 @@ class ParkingRuntime(object):
         require(frame.current(self.clock()) and self.clock()<deadline,'PARKING_SOURCE_EXPIRED_DURING_DISPATCH')
         current=[r for r in replies if r.intent_id==self.policy.session.intent_id
                  and r.revision==self.policy.session.revision]
+        suggestions=[r for r in current if r.producer=='planning' and r.candidate_options]
+        self.policy.offer_candidate_options(frame,max(suggestions,key=lambda r:r.produced_at_s) if suggestions else None)
         reply=max(current,key=lambda r:(r.produced_at_s,r.producer!='planning')) if current else None
         result=self.policy.evaluate(frame,facts,caps,reply,intent_key=value.mission.mission_id)
         self.reason=result.reason

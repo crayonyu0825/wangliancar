@@ -1,0 +1,85 @@
+{
+  "version": "behavior-inputs-v1",
+  "verified": false,
+  "verification_reference": "",
+  "scope": {"vehicle_id": "0", "case_id": "", "task_id": "", "map_digest": ""},
+  "model": {
+    "model_id": "",
+    "verification_reference": "",
+    "coordinate_frame": "world_xy_metres",
+    "body_reference": "rear_axle",
+    "gps_steering": {"verified": false, "verification_reference": "", "scale_to_front_rad": null, "sign": null, "raw_abs_max": null},
+    "vehicle": {"front_offset_m": null, "rear_offset_m": null, "half_width_m": null, "wheelbase_m": null},
+    "limits": {"max_speed_mps": null, "max_acceleration_mps2": null, "max_deceleration_mps2": null, "max_lateral_acceleration_mps2": null, "max_front_steer_rad": null, "max_steer_rate_rad_s": null, "heading_tolerance_rad": null, "distance_tolerance_m": null},
+    "execution_envelope": {"position_error_m": null, "heading_error_rad": null, "early_time_s": null, "late_time_s": null},
+    "speed_error_mps": null,
+    "prediction": {"source": "", "verification_reference": "", "horizon_s": null, "position_uncertainty_m": null, "velocity_uncertainty_mps": null},
+    "lane_search": {"distances_m": [25.0], "tangent_scales": [1.0], "speed_scales": [1.0], "spacing_m": 0.4, "max_points": 1000, "projection_ambiguity_m": 0.05},
+    "dynamic_search": {"dt_s": 0.5, "acceleration_samples": [-1.0, 0.0, 1.0], "beam_width": 24, "max_steps": 120, "max_nodes": 4000, "reserve_s": 0.01},
+    "planning_budget": {"max_checks": 1000000, "max_depth": 20, "min_interval_s": 0.00001, "max_elapsed_s": 0.1},
+    "monitor_budget": {"max_checks": 1000000, "max_depth": 20, "min_interval_s": 0.00001, "max_elapsed_s": 0.1},
+    "geometry_cache": {"max_entries": 12, "preparation_max_checks": 1000000}
+  },
+  "overtake": {
+    "enabled": false,
+    "mission_id": "",
+    "verification_reference": "",
+    "return_lane_id": "",
+    "maneuver": "OVERTAKE",
+    "target_lane_id": null,
+    "return_required": true,
+    "speed_cap_mps": null,
+    "confirmation_s": 2.0,
+    "min_advantage_mps": 1.5,
+    "transition_distance_m": 25.0,
+    "min_front_gap_m": 10.5,
+    "min_rear_gap_m": 10.5,
+    "headway_s": 1.2,
+    "maneuver_time_s": 4.0,
+    "acceleration_uncertainty_mps2": 2.0,
+    "indicator_lead_s": 1.0,
+    "settle_frames": 2,
+    "allow_command_lights": false
+  },
+  "parking": {
+    "enabled": false,
+    "verified": false,
+    "verification_reference": "",
+    "mission": {
+      "task_verified": false, "source": "", "mission_id": "", "space_id": null,
+      "road_lane_ids": [], "access_edge_index": null, "body_heading_rad": null,
+      "approach_pose": {"x": null, "y": null, "body_heading_rad": null},
+      "position_pose": {"x": null, "y": null, "body_heading_rad": null},
+      "exit_goal": {"x": null, "y": null, "body_heading_rad": null}
+    },
+    "tolerances": [null, null, null],
+    "position_uncertainty_m": null, "velocity_uncertainty_mps": null,
+    "geometry_max_checks": null, "speed_cap_mps": null,
+    "search": {
+      "tangent_scales": [], "end_tangent_scales": [], "speed_scales": [],
+      "spacing_m": null, "max_points": null, "terminal_straight_m": [],
+      "lattice": {
+        "step_lengths_m": [], "curvature_fractions": [], "curvature_change_per_m": null,
+        "xy_resolution_m": null, "heading_resolution_rad": null, "connector_distance_m": null,
+        "max_nodes": null, "max_expansions": null, "max_path_length_m": null,
+        "max_direction_changes": null, "reverse_cost": null, "direction_change_cost": null,
+        "permitted_directions": [], "direction_change_stop_duration_s": null, "heuristic_weight": null
+      }
+    }
+  },
+  "driving": {
+    "enabled": false,
+    "verified": false,
+    "verification_reference": "",
+    "mission_id": "",
+    "clock_id": "process_monotonic",
+    "passage_id": null,
+    "allowed_windows_abs_s": [],
+    "right_of_way": "UNKNOWN",
+    "speed_cap_mps": null,
+    "entry_margin_m": 0.3,
+    "exit_margin_m": 0.3,
+    "emergency_goals": [],
+    "immediate_brake_cycles": 1
+  }
+}

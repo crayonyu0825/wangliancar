@@ -102,7 +102,8 @@ class FormalParkingDecisionTests(unittest.TestCase):
         return self.policy.evaluate(self.frame(),self.read(**read_changes),capabilities or self.caps(),reply)
 
     def arrived(self,r,pose,**changes):
-        values=dict(actual_pose=pose,actual_standstill_confirmed=True,goal_pose_arrived=True,progress=1.)
+        values=dict(actual_pose=pose,actual_standstill_confirmed=True,goal_pose_arrived=True,progress=1.,
+                    motion_direction=r.goal.motion_direction,candidate_id=r.goal.candidate_id)
         values.update(changes)
         return feedback(r,self.frame(),producer='runtime',status='ARRIVED',**values)
 

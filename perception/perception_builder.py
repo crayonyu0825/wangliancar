@@ -79,6 +79,12 @@ class PerceptionBuilder(object):
             "age_ms": result.ego.age_ms})
         if not isinstance(result.source_status["gps"], dict):
             result.source_status["gps"] = {"read_ok": False, "data_invalid": True}
+        # Keep absent raw motion fields distinct from EgoState's compatibility
+        # defaults. Configured maneuver models must not treat a default zero as
+        # a current steering/yaw observation.
+        result.source_status["gps"]["motion_fields"] = [
+            name for name in ("steering", "yaw_rate", "vx", "vy")
+            if isinstance(gps, dict) and name in gps]
         if not result.ego.valid:
             result.source_status["gps"]["data_invalid"] = True
         if not result.ego.valid:
@@ -160,6 +166,12 @@ class PerceptionBuilder(object):
             target_data = []
             result.targets_valid = False
             target_meta["data_invalid"] = True
+        # Legacy Target defaults remain compatible, but a default zero is not
+        # an observed velocity for prediction or maneuver admission.
+        target_meta['motion_fields_complete']=all(isinstance(item,dict)
+            and all(name in item and isinstance(item[name],(int,float))
+                    and not isinstance(item[name],bool) and math.isfinite(item[name])
+                    for name in ('vx','vy')) for item in target_data)
         if result.ego.valid:
             for item in target_data:
                 try:

@@ -216,7 +216,8 @@ class PassageTaskPolicyTests(unittest.TestCase):
             f=frame(index,(index-1)*0.1)
             result=policy.evaluate(f,evidence(f),"d",False,capabilities=caps(f),
                 execution_feedback=feedback(policy.session.snapshot(f),f,producer="control",status="COMPLETED",
-                                            progress=1,actual_standstill_confirmed=True),
+                                            progress=1,actual_standstill_confirmed=True,
+                                            goal_pose_arrived=True,actual_pose=GoalPose(f.ego_x,f.ego_y,f.ego_heading)),
                 verified_task_route_available=True)
         self.assertEqual("COMPLETE",result.phase)
         self.assertFalse(result.immediate_brake_required)

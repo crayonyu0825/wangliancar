@@ -102,6 +102,9 @@ class FixedParkingDecisionTests(unittest.TestCase):
     def test_existing_signal_dwell_has_priority_even_after_green(self):
         from tests.test_decision import add_red_light
         self.enabled=False; p=self.f.p; p.scene_id=20
+        # This test explicitly starts a new authored scene. A changed scene
+        # cannot silently keep the parking fixture's previous runtime session.
+        self.h.transport.reset_session(); self.f.build()
         self.h.transport.actions+=('PATH_STOP',)
         add_red_light(p,20.); p.traffic.signal_id=42
         first=self.decide(); self.assertIsNotNone(first.behavior_request,first.reason)

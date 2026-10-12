@@ -51,11 +51,13 @@ class LaneChangePolicy(object):
     def __init__(self, front_m, rear_m, half_width_m, min_front_gap_m=10.5,
                  min_rear_gap_m=10.5, time_headway_s=1.2, maneuver_time_s=4.0,
                  acceleration_uncertainty_mps2=2.0, indicator_lead_s=1.0,
-                 settle_frames=2, session=None):
+                 settle_frames=2, session=None, allow_command_lights=False):
         require(all(finite(v) and v > 0 for v in (front_m, rear_m, half_width_m,
                 min_front_gap_m, min_rear_gap_m, time_headway_s, maneuver_time_s,
                 acceleration_uncertainty_mps2, indicator_lead_s)), "invalid lane-change limits")
         require(type(settle_frames) is int and settle_frames > 0, "invalid settlement count")
+        require(type(allow_command_lights) is bool, 'invalid command-lamp trial policy')
+        self.allow_command_lights=allow_command_lights
         self.front_m, self.rear_m, self.half_width_m = front_m, rear_m, half_width_m
         self.front_gap, self.rear_gap, self.headway = min_front_gap_m, min_rear_gap_m, time_headway_s
         self.duration, self.uncertainty, self.indicator_lead_s = maneuver_time_s, acceleration_uncertainty_mps2, indicator_lead_s
@@ -144,7 +146,11 @@ class LaneChangePolicy(object):
             extent = 0.5 * math.hypot(obj.length, obj.width)+age_margin
             angle = None if obj.heading is None else obj.heading - proj['heading']
             lateral = extent if angle is None else .5*(obj.length*abs(math.sin(angle))+obj.width*abs(math.cos(angle)))+age_margin
-            if proj["distance"] > candidate.width_m / 2 + lateral:
+            # A clamped endpoint distance also contains longitudinal distance.
+            # It cannot prove that a rear/front object is in another lane. Keep
+            # the clamped station as a conservative gap bound in that case.
+            if (projection_within_polyline(proj,len(candidate.center_line))
+                    and proj["distance"] > candidate.width_m / 2 + lateral):
                 continue
             rel = proj["s"] - ego["s"]
             velocity = math.cos(proj["heading"]) * obj.vx + math.sin(proj["heading"]) * obj.vy
@@ -254,6 +260,7 @@ class LaneChangePolicy(object):
             if self.session.retry_after_evidence(frame, "CORRIDOR_RECOVERED_REPLAN"):
                 recovery_goal = BehaviorGoal(target_lane_id=current.lane_id,source_lane_id=current.source_lane_id,
                     goal_pose=self.session.goal.goal_pose,speed_cap_mps=self._speed_cap,
+                    candidate_id=self.session.goal.candidate_id,
                     light_intent=LightIntent(left_signal=current.side == "left", right_signal=current.side == "right"))
                 self.session.advance(frame, "REQUEST_PATH" if old_stage in ("EXECUTE", "SETTLE") else "PREPARE",
                                      recovery_goal, reason="RECOVERY_PATH_REVALIDATION_REQUIRED")
@@ -267,7 +274,9 @@ class LaneChangePolicy(object):
         checked_revision=request.revision
         if self.session.stage == "PREPARE":
             if (reply is not None and reply.producer in ("control", "runtime")
-                    and reply.lights_confirmed and reply.lights_duration_s >= self.indicator_lead_s):
+                    and ((reply.lights_confirmed and reply.lights_duration_s >= self.indicator_lead_s)
+                         or (self.allow_command_lights and reply.lights_evidence_level=='command_sent'
+                             and reply.lights_command_duration_s>=self.indicator_lead_s))):
                 request = self.session.advance(frame, "WAIT_GAP", reason="INDICATOR_CONFIRMED")
         elif self.session.stage == "WAIT_GAP":
             if safe:
@@ -277,12 +286,15 @@ class LaneChangePolicy(object):
             if not safe:
                 request = self.session.advance(frame, "WAIT_GAP", reason=reason)
             elif reply is not None and reply.producer == "planning" and reply.status == "PLANNED":
+                self.session.goal.candidate_id=reply.candidate_id
                 self._execution_started=True
                 request = self.session.advance(frame, "EXECUTE", reason="MATCHING_PATH_ACCEPTED")
         elif self.session.stage in ("EXECUTE", "SETTLE"):
             reached = False
             if reply is not None and reply.producer in ("control", "runtime") and reply.actual_pose is not None:
                 reached = (current.is_current_lane and reply.actual_lane_id==current.lane_id
+                           and (self.session.goal.candidate_id is None
+                                or reply.candidate_id==self.session.goal.candidate_id)
                            and reply.motion_direction==1
                            and self._body_inside(reply.actual_pose,current)
                            and self._body_inside(GoalPose(frame.ego_x,frame.ego_y,frame.ego_heading),current))

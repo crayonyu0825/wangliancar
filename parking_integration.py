@@ -14,6 +14,7 @@ from core.interfaces import DecisionTarget,Trajectory,ControlOut
 from core.safety_supervisor import SafetyAssessment
 from core.validation import validate_output
 from core.maneuver_facts import ManeuverFacts
+from core.execution_monitor import ExecutionMonitor
 from members.decision.behaviors.parking_runtime import ParkingDecisionInputs
 from members.planning.parking_behavior import ParkingPlanningInputs
 from members.planning.maneuver_inputs import read_inputs
@@ -27,7 +28,8 @@ PARKING_ACTIONS=('PARK','PATH','REVERSE','DWELL','FEEDBACK')
 
 def _planning_copy(value):
     result=copy.copy(value)
-    for name in ('context','mission','tolerances','vehicle','limits','search','budget','prediction_envelopes'):
+    for name in ('context','mission','tolerances','vehicle','limits','search','budget','prediction_envelopes',
+                 'execution_envelope','dynamic_search','speed_error_mps'):
         setattr(result,name,copy.deepcopy(getattr(value,name)))
     return result
 
@@ -59,10 +61,69 @@ class ParkingInputBridge(object):
         self.settings=None
         self.key,self.value,self.error=None,None,None
         self.reason='NOT_PREPARED'
+        self.execution_monitor=ExecutionMonitor()
+        self.execution_tracking=None
+        self._execution_key=None
+        self._execution_model=None
 
     @staticmethod
     def _key(p,context):
         return (id(p),context.key(),p.frame_id,p.timestamp)
+
+    def _observe_execution(self,p,t,model):
+        self._execution_model=model
+        if model.execution_envelope is None and not self.execution_monitor.history:
+            self.execution_tracking=dict(active=False,status='NOMINAL_ONLY',reason_code='EXECUTION_ENVELOPE_NOT_CONFIGURED')
+            return self.execution_tracking
+        self.execution_monitor.max_speed_mps=model.limits.max_speed_mps
+        self.execution_monitor.speed_error_mps=model.speed_error_mps
+        gps=p.source_status.get('gps',{}) if isinstance(p.source_status,dict) else {}
+        environment=getattr(p,'maneuver_environment',None)
+        actual=(p.case_id,p.task_id,p.scene_id,p.frame_id,p.timestamp,p.ego.x,p.ego.y,p.ego.heading,
+                p.ego.speed,p.ego.vx,p.ego.vy,p.valid,p.valid_until,p.ego.valid,p.ego.frame_id,p.ego.timestamp,
+                tuple((key,copy.deepcopy(gps.get(key))) for key in
+                      ('usable','quality','frame_id','timestamp','observed_at_s')),
+                tuple(getattr(environment,key,None) for key in ('valid','frame_id','timestamp','observed_at_s','valid_until_s')),
+                None if model.execution_envelope is None else tuple(sorted(vars(model.execution_envelope).items())),
+                model.limits.max_speed_mps,model.speed_error_mps)
+        if actual!=self._execution_key:
+            self.execution_tracking=self.execution_monitor.observe(p,t,model.execution_envelope,self.clock())
+            self._execution_key=actual
+        return self.execution_tracking
+
+    def assess_execution(self,p,trajectory):
+        """Observe sent history every frame, including the stage after PARK.
+
+        Retaining model values only checks the prior sent occupancy bounds;
+        it does not create fresh parking task/model evidence for a new send.
+        """
+        try:
+            context,unused,unused=read_channel(p,self.clock())
+            pair=self._read(p,context)
+            model=pair.planning if pair is not None else self._execution_model
+            if model is None:
+                return SafetyAssessment()
+            report=self._observe_execution(p,trajectory,model)
+            return SafetyAssessment('controlled_stop','PARKING_EXECUTION:'+report['reason_code']) if report['active'] else SafetyAssessment()
+        except (ValueError,TypeError,AttributeError,KeyError) as error:
+            return SafetyAssessment('controlled_stop','PARKING_EXECUTION_INPUT:'+str(error)) if self.execution_monitor.history else SafetyAssessment()
+
+    def record_sent(self,p,trajectory,receipt,safety_active=False):
+        """Only the captain's successful inactive-safety send arms a timeline."""
+        if safety_active or not isinstance(receipt,dict) or receipt.get('attempted') is not True or receipt.get('ok') is not True:
+            return dict(active=False,status='NOT_ARMED',reason_code='PARKING_SEND_NOT_CONFIRMED_OR_SAFETY_ACTIVE')
+        try:
+            context,unused,unused=read_channel(p,self.clock()); pair=self._read(p,context)
+            require(pair is not None,'PARKING_PAIR_WITHDRAWN')
+            model=pair.planning
+            if model.execution_envelope is None:
+                require(not self.execution_monitor.history,'PARKING_EXECUTION_BOUNDS_WITHDRAWN')
+                return dict(active=False,status='NOMINAL_ONLY',reason_code='EXECUTION_ENVELOPE_NOT_CONFIGURED')
+            self.execution_monitor.max_speed_mps=model.limits.max_speed_mps
+            self.execution_monitor.speed_error_mps=model.speed_error_mps
+            return self.execution_monitor.record_sent(p,trajectory,model.execution_envelope,self.clock(),receipt)
+        except (ValueError,TypeError,AttributeError,KeyError) as error:
+            return dict(active=True,status='BLOCKED',reason_code='PARKING_RECORD_SENT:'+str(error))
 
     def prepare(self,p):
         """Read once per original frame; repeated GPS never refreshes evidence."""
@@ -158,10 +219,21 @@ class ParkingInputBridge(object):
                 frame_usable=p.valid,frame_paused=False,runtime_parking=True)
             require(assessment['eligible'],assessment['reason_code'])
             r=assessment['request']; d,m=pair.decision,pair.planning
+            tracking=self.assess_execution(p,trajectory)
+            require(not tracking.active,tracking.reason)
             facts=ManeuverFacts(p,self.clock); bay=facts.parking(m.mission.space_id)
+            original=m.mission.stage_pose(r['stage'],bay,*d.extents[:2]).to_dict()
+            segmented=r['stage']=='ALIGN' and isinstance(r.get('candidate_id'),str) and bool(r['candidate_id'])
             require(facts.map_digest()==m.mission.map_digest and r['parking_space_id']==m.mission.space_id
-                    and r['goal_pose']==m.mission.stage_pose(r['stage'],bay,*d.extents[:2]).to_dict(),
+                    and (r['goal_pose']==original or segmented),
                     'PARKING_MONITOR_ORIGINAL_TASK_MISMATCH')
+            if segmented:
+                require(trajectory.candidate_id==r['candidate_id']
+                    and isinstance(trajectory.behavior_feedback,dict)
+                    and trajectory.behavior_feedback.get('candidate_id')==r['candidate_id']
+                    and trajectory.planning_metrics.get('parking_segment') is True
+                    and trajectory.planning_metrics.get('original_parking_goal')==original,
+                    'PARKING_MONITOR_SEGMENT_IDENTITY_MISMATCH')
             require(trajectory.motion_direction==r['motion_direction']
                     and all(finite(v) for v in (p.ego.vx,p.ego.vy,p.ego.heading,p.ego.speed))
                     and not opposes_direction(p.ego.vx,p.ego.vy,p.ego.heading,p.ego.speed,
@@ -178,9 +250,15 @@ class ParkingInputBridge(object):
                     and (stopped_hold or abs(first.speed-p.ego.speed)<=1e-9),
                     'PARKING_MONITOR_ACTUAL_START_MISMATCH')
             identity={k:r[k] for k in ('intent_id','stage','revision')}
-            preparing=trajectory.reason=='PARKING_STOPPED_STEERING_PREPARATION'
+            proposal=trajectory.planning_metrics.get('parking_segment_proposal') is True
+            preparing=trajectory.planning_metrics.get('parking_stopped_steering_preparation') is True or proposal
             if preparing:
                 require(trajectory.behavior_identity is None and stopped_hold,'PARKING_MONITOR_PREPARATION_MOVES')
+                if proposal:
+                    require(isinstance(trajectory.behavior_feedback,dict)
+                        and trajectory.behavior_feedback.get('status')=='REJECTED'
+                        and trajectory.behavior_feedback.get('candidate_options'),
+                        'PARKING_MONITOR_UNBOUND_SEGMENT_PROPOSAL')
             else:
                 require(trajectory.behavior_identity==identity,'PARKING_MONITOR_IDENTITY_MISMATCH')
                 goal=r['goal_pose']; end=trajectory.points[-1]
@@ -191,7 +269,9 @@ class ParkingInputBridge(object):
             require(all(v.speed<=max(p.ego.speed,cap)+1e-9 for v in trajectory.points),
                     'PARKING_MONITOR_SPEED_LIMIT_MISMATCH')
             report=validate_parking_path(p,m.mission,r['stage'],trajectory.points,trajectory.motion_direction,
-                m.vehicle,m.limits,pair.monitor_budget,m.prediction_envelopes,self.clock)
+                m.vehicle,m.limits,pair.monitor_budget,m.prediction_envelopes,self.clock,
+                intermediate_segment=segmented and r['goal_pose']!=original,
+                execution_envelope=m.execution_envelope)
             if report['status']=='unsafe': mode='emergency_stop'
             require(report['status']=='safe','PARKING_MONITOR_PATH:'+report['reason_code'])
             self._read(p,context)

@@ -7,7 +7,16 @@ from members.decision.behaviors.contract import Capabilities, GoalPose
 from members.decision.behaviors.observations import Evidence, MotionObject
 from members.decision.behaviors.lane_change import LaneCandidate, LaneChangePolicy
 from members.decision.behaviors.parking import ParkingSpace, ParkingFacts, ParkingPolicy
-from tests.test_decision_behavior_contract import frame, feedback
+from tests.test_decision_behavior_contract import frame, feedback as contract_feedback
+
+
+def feedback(request, f, **changes):
+    # These are authored synthetic stopped-pose observations. Parking cases
+    # explicitly report the direction of the stage they model; the generic
+    # contract fixture's forward default is not reverse execution evidence.
+    if request.maneuver == 'PARK':
+        changes.setdefault('motion_direction', request.goal.motion_direction)
+    return contract_feedback(request, f, **changes)
 
 
 def evidence(f, covered=True):

@@ -43,6 +43,9 @@ def validate_output(value, expected, source):
                        for key, gap in value.obstacle_clearances_m.items())):
             raise ValueError("invalid per-target clearance")
     elif expected is Trajectory:
+        if (not isinstance(value.planning_metrics,dict) or value.candidate_id is not None
+                and (not isinstance(value.candidate_id,str) or not 0<len(value.candidate_id)<=256)):
+            raise ValueError('invalid trajectory candidate metadata')
         identity = value.behavior_identity
         if (not isinstance(value.stop_obligation_id,str) or (identity is not None and
                 (not isinstance(identity,dict) or set(identity)!={"intent_id","stage","revision"}
@@ -53,11 +56,14 @@ def validate_output(value, expected, source):
             # Moving behavior paths carry identity without a dwell duty. Keep
             # this boundary limited to an actually acknowledged P03/P04 stage.
             reply=value.behavior_feedback
-            parking=identity['stage'] in ('APPROACH','POSITION','EXIT_PREPARE','EXIT')
+            parking=(identity['stage'] in ('APPROACH','POSITION','ALIGN','EXIT_PREPARE')
+                     or identity['stage']=='EXIT' and value.precision_stop)
             parking_shape=(value.precision_stop and value.stop_required and value.stop_distance>=0
-                and value.motion_direction==(-1 if identity['stage']=='EXIT_PREPARE' else 1)
+                and value.motion_direction in ((-1,1) if identity['stage'] in ('ALIGN','EXIT_PREPARE') else (1,))
                 and bool(value.points) and value.points[-1].speed==0)
-            if (value.hold_duration_s!=0 or (identity['stage'] not in ('EXECUTE','SETTLE') and not parking)
+            driving=identity['stage'] in ('WAIT_ENTRY','ENTER','EXIT','BRAKE_FALLBACK',
+                'EXECUTE_BRAKE','EXECUTE_LEFT','EXECUTE_RIGHT','EXECUTE_BRAKE_LEFT','EXECUTE_BRAKE_RIGHT')
+            if (value.hold_duration_s!=0 or (identity['stage'] not in ('EXECUTE','SETTLE') and not parking and not driving)
                     or (parking and not parking_shape)
                     or not isinstance(reply,dict) or reply.get('producer')!='planning'
                     or reply.get('status')!='PLANNED' or reply.get('usable') is not True

@@ -71,7 +71,7 @@ class TargetLaneContinuationTests(unittest.TestCase):
 
     def test_settle_stage_uses_same_remaining_lane_proof(self):
         r,d=self.enter()
-        result=self.h.evaluate(self.h.actual_reply(r))
+        result=self.h.evaluate(self.h.actual_reply(r,candidate_id=self.h.policy.session.goal.candidate_id))
         self.assertEqual('SETTLE',result.request.stage)
         t=planning_stub.plan(self.f.p,self.b.decision(result.request))
         self.assertTrue(t.valid,t.errors)
@@ -79,7 +79,7 @@ class TargetLaneContinuationTests(unittest.TestCase):
 
     def test_whole_body_in_target_may_align_but_cannot_complete_while_heading_is_unstable(self):
         r,d=self.enter(x=27.4,y=2.86,yaw=.17)
-        result=self.h.evaluate(self.h.actual_reply(r))
+        result=self.h.evaluate(self.h.actual_reply(r,candidate_id=self.h.policy.session.goal.candidate_id))
         self.assertFalse(result.hold_required,result.reason)
         self.assertEqual('EXECUTE',result.phase)
         self.assertNotEqual('COMPLETED',result.request.status)

@@ -15,6 +15,7 @@ class ManeuverMap(object):
         self.adapter,self.document,self.digest,self.parse_reason = adapter,None,None,"DOCUMENT_UNAVAILABLE"
         self.crossing_ranges = CrossingRanges()
         self.road_regions = RoadRegions()
+        self.passage_sources = {}
         self._read()  # Parse at route-manager construction, before driving loop.
 
     def _read(self):
@@ -29,6 +30,7 @@ class ManeuverMap(object):
             if not isinstance(digest,str) or len(digest)!=32:
                 return dict(verified=False,reason="MAP_DIGEST_UNAVAILABLE")
             if self.digest!=digest:
+                self.passage_sources.clear()
                 self.crossing_ranges.clear()
                 self.road_regions.clear()
                 self.document,self.digest,self.parse_reason = None,digest,"DOCUMENT_INVALID_OR_UNSUPPORTED"

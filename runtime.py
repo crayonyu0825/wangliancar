@@ -9,13 +9,17 @@ import time
 from core.serialization import perception_to_dict, to_dict
 from core.validation import validate_output
 from core.interfaces import DecisionTarget, Trajectory, ControlOut
-from core.safety_supervisor import SafetySupervisor
+from core.safety_supervisor import SafetySupervisor,SafetyAssessment
 from core.scene_requirements import requires_targets
 from members.control_stub import compute_control, configure_control
 from members.decision_stub import decide, decision_info, decision_settings, reset_decision
 from members.planning_stub import plan, configure_planning
 from core.behavior_channel import BehaviorTransport
 from parking_integration import ParkingInputBridge,PARKING_ACTIONS
+from lane_change_integration import LaneChangeInputBridge,LANE_CHANGE_CAPABILITIES
+from driving_integration import DrivingInputBridge,DRIVING_ACTIONS
+from behavior_inputs import load_behavior_inputs
+from members.decision.settings import DecisionSettings
 from perception.perception_builder import PerceptionBuilder
 from perception.route_manager import RouteManager, ROUTE_REFERENCE_VERSION
 from simone_platform.simone_adapter import SimOneAdapter
@@ -78,9 +82,21 @@ def target_input_summary(perception):
 
 
 class CaptainRuntime(object):
-    def __init__(self, config, logger,parking_inputs_provider=None,parking_actions=()):
+    def __init__(self, config, logger,parking_inputs_provider=None,parking_actions=(),
+                 lane_change_inputs_provider=None,lane_change_actions=(),
+                 driving_inputs_provider=None,driving_actions=()):
         self.config = config
         self.logger = logger
+        self.configured_behaviors=load_behavior_inputs(config)
+        if parking_inputs_provider is None and not parking_actions:
+            parking_inputs_provider=self.configured_behaviors.parking_provider
+            parking_actions=self.configured_behaviors.parking_actions
+        if lane_change_inputs_provider is None and not lane_change_actions:
+            lane_change_inputs_provider=self.configured_behaviors.lane_change_provider
+            lane_change_actions=self.configured_behaviors.lane_change_actions
+        if driving_inputs_provider is None and not driving_actions:
+            driving_inputs_provider=self.configured_behaviors.driving_provider
+            driving_actions=self.configured_behaviors.driving_actions
         self.adapter = SimOneAdapter(config, logger)
         self.stop_requested = False
         self.pid_path = os.path.join(config.runtime_dir, "captain.pid")
@@ -103,25 +119,76 @@ class CaptainRuntime(object):
             raise ValueError('parking capabilities require explicit paired inputs and configured control')
         self.parking=(ParkingInputBridge(parking_inputs_provider)
                       if parking_inputs_provider is not None else None)
+        if (not isinstance(lane_change_actions,(tuple,list)) or
+                (lane_change_actions and (set(lane_change_actions)!=set(LANE_CHANGE_CAPABILITIES)
+                 or len(lane_change_actions)!=len(LANE_CHANGE_CAPABILITIES)
+                 or lane_change_inputs_provider is None or getattr(config,'control_calibrated',False) is not True))):
+            raise ValueError('lane-change capabilities require explicit paired inputs and configured control')
+        # Both task assertions and error bounds come from the captain's provider.
+        # A normal runtime never creates synthetic model or visibility evidence.
+        self.lane_changes=(LaneChangeInputBridge(lane_change_inputs_provider)
+                           if lane_change_inputs_provider is not None else None)
+        if (not isinstance(driving_actions,(tuple,list)) or
+                (driving_actions and (set(driving_actions)!=set(DRIVING_ACTIONS)
+                 or len(driving_actions)!=len(DRIVING_ACTIONS)
+                 or driving_inputs_provider is None or getattr(config,'control_calibrated',False) is not True))):
+            raise ValueError('driving capabilities require explicit paired inputs and configured control')
+        self.driving=(DrivingInputBridge(driving_inputs_provider)
+                      if driving_inputs_provider is not None else None)
         planning_settings = configure_planning(config,parking_inputs_provider=(
-            self.parking.planning_inputs if self.parking else None))
+            self.parking.planning_inputs if self.parking else None),lane_change_inputs_provider=(
+            self.lane_changes.planning_inputs if self.lane_changes else None),driving_inputs_provider=(
+            self.driving.planning_inputs if self.driving else None),
+            vehicle_geometry=self.configured_behaviors.vehicle_geometry)
         if self.parking: self.parking.settings=planning_settings
-        reset_decision(parking_inputs_provider=self.parking.decision_inputs if self.parking else None)
+        if self.lane_changes: self.lane_changes.settings=planning_settings
+        if self.driving: self.driving.settings=planning_settings
+        decision_model_settings=DecisionSettings.from_environment()
+        geometry=self.configured_behaviors.vehicle_geometry
+        if geometry is not None:
+            for field in ('front_offset_m','half_width_m'):
+                value=getattr(geometry,field); existing=getattr(decision_model_settings,field)
+                if existing is not None and not math.isclose(existing,value,rel_tol=1e-9,abs_tol=1e-9):
+                    raise ValueError('decision/configured model body geometry differs: '+field)
+                setattr(decision_model_settings,field,value)
+            decision_model_settings.cruise_speed=min(decision_model_settings.cruise_speed,
+                                                     self.configured_behaviors.limits.max_speed_mps)
+        reset_decision(settings=decision_model_settings,
+                       parking_inputs_provider=self.parking.decision_inputs if self.parking else None,
+                       lane_change_inputs_provider=self.lane_changes.decision_inputs if self.lane_changes else None,
+                       driving_inputs_provider=self.driving.decision_inputs if self.driving else None)
         _validate_motion_contract(planning_settings, decision_settings())
         self.safety = SafetySupervisor(config, planning_settings=planning_settings,
                                        decision_settings=decision_settings(),parking_guard=(
-                                           self.parking.assess if self.parking and parking_actions else None))
+                                           self.parking.assess if self.parking and parking_actions else None),
+                                       lane_change_guard=(self.lane_changes.assess
+                                           if self.lane_changes and lane_change_actions else None),
+                                       driving_guard=(self.driving.assess
+                                           if self.driving and driving_actions else None),
+                                       execution_guard=self._assess_execution)
         self.runtime_info = decision_info()
         self.runtime_info.update({"pid": os.getpid(),
                                   "project_dir": os.path.dirname(os.path.abspath(__file__)),
                                   "target_ingestion_version": TARGET_INGESTION_VERSION,
                                   "route_reference_version": ROUTE_REFERENCE_VERSION,
                                   "planning_settings": dict(vars(planning_settings)),
+                                  "behavior_model_status":self.configured_behaviors.status,
                                   "started_at": time.strftime("%Y-%m-%d %H:%M:%S")})
         configure_control(config)
         actions=list(("PATH_STOP","DWELL","FEEDBACK")
                      if getattr(config,"control_calibrated",False) else ())
-        self.behaviors = BehaviorTransport(tuple(dict.fromkeys(actions+list(parking_actions))))
+        self.behaviors = BehaviorTransport(tuple(dict.fromkeys(
+            actions+list(parking_actions)+list(lane_change_actions)+list(driving_actions))))
+
+    def _assess_execution(self,perception,trajectory):
+        # All configured bridges check the previous actually sent command,
+        # including ordinary paths between their private maneuver stages.
+        for bridge in (self.parking,self.lane_changes,self.driving):
+            if bridge is not None and hasattr(bridge,'assess_execution'):
+                result=bridge.assess_execution(perception,trajectory)
+                if result.active:
+                    return result
+        return SafetyAssessment()
 
     def request_stop(self, unused_signal=None, unused_frame=None):
         self.stop_requested = True
@@ -206,6 +273,8 @@ class CaptainRuntime(object):
             last_frame = perception.frame_id
             self.behaviors.prepare(perception)
             if self.parking: self.parking.prepare(perception)
+            if self.lane_changes: self.lane_changes.prepare(perception)
+            if self.driving: self.driving.prepare(perception)
             try:
                 decision = _member_output(decide(perception), DecisionTarget, perception)
             except Exception as exc:
@@ -260,6 +329,12 @@ class CaptainRuntime(object):
                 else:
                     receipt["reason"] = "pipeline_invalid"
             self.behaviors.observe(perception,decision,trajectory,control,safety.active,receipt)
+            for bridge in (self.parking,self.lane_changes,self.driving):
+                if bridge is not None:
+                    bridge.record_sent(perception,trajectory,receipt,safety.active)
+            if self.lane_changes:
+                self.lane_changes.observe_lights(perception,decision,trajectory,control,
+                                                self.behaviors,receipt,safety.active)
             # Flush after sending control, so file I/O cannot expire its frame.
             self._flush_evaluation()
             if self.config.publish_json:

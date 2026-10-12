@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -162,8 +163,8 @@ class EvaluationTests(unittest.TestCase):
             self.assertTrue(r._acquire_instance_lock())
             r._release_instance_lock()
 
-    @unittest.skipUnless(os.name == "nt" and os.path.isfile(
-        r"E:\Sim-One\Tools\python36\python.exe"), "requires Windows SimOne Python")
+    @unittest.skipUnless(os.name == "nt" and sys.version_info[:2]==(3,6),
+                         "requires Windows target Python 3.6")
     def test_real_end_batch_requests_save_and_exit_without_force_kill(self):
         project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         fixture = '''import os,sys,json,logging
@@ -209,7 +210,7 @@ with patch("runtime.RouteManager"),patch("runtime.PerceptionBuilder",return_valu
             main = os.path.join(directory, "main.py")
             with open(main, "w", encoding="utf-8") as stream:
                 stream.write(fixture)
-            process = subprocess.Popen([r"E:\Sim-One\Tools\python36\python.exe", main],
+            process = subprocess.Popen([sys.executable, main],
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             try:
                 pid = os.path.join(directory, "runtime_data", "captain.pid")

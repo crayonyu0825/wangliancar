@@ -4,10 +4,11 @@ No SDK, task selection, calibration or capability provider is installed here.
 Every stage rechecks formal sources; actual feedback alone advances stages.
 """
 import copy
+import hashlib
 import math
 import time
 from core.behavior_channel import read_channel,capabilities_dict,feedback_dict
-from core.behavior_contract import BehaviorFrame,ExecutionFeedback,require,finite
+from core.behavior_contract import BehaviorFrame,ExecutionFeedback,BehaviorGoal,GoalPose,require,finite
 from core.interfaces import Trajectory,TrajectoryPoint,DecisionTarget,DecisionMode
 from core.validation import validate_output
 from core.geometry import normalize_angle,project_polyline,opposes_direction
@@ -19,7 +20,7 @@ from members.planning.maneuver_inputs import ManeuverPlanningInputs,read_inputs
 from members.planning.parking_scene import plan_parking_candidate,read_parking_scene
 from members.planning.lane_change_generator import _Work,_source_predictions,_Failure,_timed,_motion_parameters
 from members.planning.candidate_validation import ValidationBudget
-from members.planning.parking_generator import _search_parameters
+from members.planning.parking_generator import _search_parameters,_timed_parking
 
 
 class ParkingPlanningInputs(ManeuverPlanningInputs):
@@ -37,7 +38,7 @@ class ParkingBehaviorPlanner(object):
     def __init__(self,inputs_provider=None,clock=None):
         require(inputs_provider is None or callable(inputs_provider),'invalid parking input provider')
         self.provider,self.clock=inputs_provider,clock or time.monotonic
-        self.context,self.records=None,{}
+        self.context,self.records,self.segment_plans=None,{},{}
 
     @staticmethod
     def _near(x,y,yaw,pose,tolerances):
@@ -45,10 +46,11 @@ class ParkingBehaviorPlanner(object):
                 and abs(normalize_angle(yaw-pose.body_heading_rad))<=tolerances[1])
 
     @staticmethod
-    def _reply(context,request,p,now,deadline,status,reason):
+    def _reply(context,request,p,now,deadline,status,reason,candidate_id=None,options=None,metrics=None):
         return feedback_dict(ExecutionFeedback(context,request['intent_id'],request['stage'],request['revision'],
             'planning',p.frame_id,p.frame_id,now,deadline,status,usable=now<deadline,
-            reason_code=reason,retryable=status=='REJECTED'))
+            reason_code=reason,retryable=status=='REJECTED',candidate_id=candidate_id,
+            candidate_options=options,planning_metrics=metrics))
 
     def _transition(self,p,request,previous,feedbacks,context):
         stage=request['stage']
@@ -58,11 +60,21 @@ class ParkingBehaviorPlanner(object):
         old=previous['revision']; revision=(request['revision'],stage,request['source_frame_id'],request['issued_at_s'])
         require(revision==old or (revision[0]>old[0] and revision[2]>=old[2] and revision[3]>=old[3]),
                 'REQUEST_REVISION_REGRESSED_OR_CHANGED')
-        if stage==old[1]: return
+        changed_goal=(request['goal_pose']!=previous['pose'].to_dict()
+                      or request['motion_direction']!=previous['direction']
+                      or (previous.get('segment_candidate') and
+                          request.get('candidate_id')!=previous.get('candidate_id')))
+        if stage==old[1] and not changed_goal: return
+        if previous.get('segment_proposal'):
+            require(stage=='ALIGN' and p.ego.speed<=previous['tolerances'][2]
+                    and self._near(p.ego.x,p.ego.y,p.ego.heading,previous['proposal_start_pose'],previous['tolerances']),
+                    'PARKING_INITIAL_SEGMENT_REQUIRES_ORIGINAL_STOPPED_POSITION')
+            return
         require(previous['accepted'],'PARKING_PRIOR_STAGE_PATH_NOT_ACCEPTED')
-        require(stage in self.transitions[old[1]],'PARKING_STAGE_SEQUENCE_CHANGED')
+        require(stage in self.transitions[old[1]] or (old[1]==stage=='ALIGN' and changed_goal),
+                'PARKING_STAGE_SEQUENCE_CHANGED')
         now=self.clock(); pose=previous['pose']; tolerances=previous['tolerances']
-        alignment=old[1]=='REVERSE_ENTRY' and stage=='ALIGN'
+        alignment=old[1]=='REVERSE_ENTRY' and stage=='ALIGN' and not previous.get('segment_candidate')
         require(p.ego.speed<=tolerances[2] and (alignment or self._near(p.ego.x,p.ego.y,p.ego.heading,pose,tolerances)),
                 'PARKING_PRIOR_GOAL_NOT_ACTUALLY_STOPPED')
         for f in feedbacks:
@@ -73,6 +85,7 @@ class ParkingBehaviorPlanner(object):
                     and f.produced_at_s<=now< f.valid_until_s and now-f.produced_at_s<=.5
                     and f.actual_pose is not None and f.actual_standstill_confirmed
                     and f.motion_direction==previous['direction']
+                    and (previous.get('candidate_id') is None or f.candidate_id==previous['candidate_id'])
                     and f.status not in ('FAILED','REJECTED','PLANNED')
                     and self._near(p.ego.x,p.ego.y,p.ego.heading,f.actual_pose,tolerances)
                     and ((alignment and f.progress>=1) or (f.goal_pose_arrived and
@@ -81,6 +94,81 @@ class ParkingBehaviorPlanner(object):
                         and f.standstill_duration_s>=previous['dwell']))):
                 return
         raise ValueError('PARKING_MATCHED_ACTUAL_STAGE_FEEDBACK_REQUIRED')
+
+    @staticmethod
+    def _option(intent,index,sequence,mission,cap,deadline):
+        segment=sequence[index]; endpoint=segment['goal']
+        goal=BehaviorGoal(parking_space_id=mission.space_id,goal_pose=GoalPose(*endpoint),
+                          motion_direction=segment['direction'],speed_cap_mps=cap,precision_stop=True,
+                          candidate_id=segment['candidate_id'])
+        return dict(candidate_id=segment['candidate_id'],action='PARK',goal=goal.to_dict(),feasible=True,
+            risk_cost=segment['risk_cost'],rule_cost=segment['rule_cost'],validation_reason='P02_SEGMENT_CERTIFIED',
+            source_valid_until_s=deadline,segment_id=segment['candidate_id'],segment_count=len(sequence))
+
+    def _propose_segments(self,p,mission,model,request,result,binding,deadline):
+        require(p.ego.speed<=model.tolerances[2] and request['stage'] in ('REVERSE_ENTRY','ALIGN'),
+                'PARKING_MULTISEGMENT_INITIAL_STOP_REQUIRED')
+        sequence=[]
+        raw=result['maneuver_segments']
+        require(1<=len(raw)<=128,'PARKING_SEGMENT_COUNT_INVALID')
+        for index,segment in enumerate(raw):
+            end=segment['points'][-1]
+            token=repr((request['intent_id'],p.frame_id,index,end.x,end.y,end.heading,segment['motion_direction']))
+            identifier='parking:'+hashlib.sha256(token.encode('utf-8')).hexdigest()[:24]
+            gap=segment['access_report'].get('clearance_lower_bound_m')
+            require(finite(gap) and gap>0,'PARKING_SEGMENT_CLEARANCE_UNPROVED')
+            sequence.append(dict(goal=(end.x,end.y,end.heading),direction=segment['motion_direction'],
+                candidate_id=identifier,risk_cost=1./gap,rule_cost=segment['stop_distance']))
+        plan=dict(binding=binding,sequence=tuple(sequence),authorized_index=-1,offered_index=0,
+                  offered_until=deadline,original_goal=mission.stage_pose('PARKED_DWELL',
+                    ManeuverFacts(p,self.clock).parking(mission.space_id),model.vehicle.front_offset_m,
+                    model.vehicle.rear_offset_m).to_dict())
+        self.segment_plans[request['intent_id']]=plan
+        return self._option(request['intent_id'],0,sequence,mission,request['speed_cap_mps'],deadline)
+
+    def _authorized_segment(self,request,binding,now):
+        plan=self.segment_plans.get(request.get('intent_id'))
+        require(plan is not None and plan['binding']==binding,'PARKING_SEGMENT_PLAN_UNAVAILABLE')
+        matching=[i for i,s in enumerate(plan['sequence']) if GoalPose(*s['goal']).to_dict()==request['goal_pose']
+                  and s['direction']==request['motion_direction']
+                  and s['candidate_id']==request.get('candidate_id')]
+        index=plan['authorized_index']
+        if index not in matching:
+            index=plan['offered_index']
+            require(index in matching and index==plan['authorized_index']+1 and now<plan['offered_until'],
+                    'PARKING_SEGMENT_NOT_CURRENTLY_OFFERED')
+        require(request.get('candidate_id')==plan['sequence'][index]['candidate_id'],
+                'PARKING_SEGMENT_CANDIDATE_ID_MISMATCH')
+        return plan,index,GoalPose(*plan['sequence'][index]['goal'])
+
+    def _intermediate(self,request):
+        plan=self.segment_plans.get(request.get('intent_id'))
+        return bool(request.get('candidate_id') and plan is not None
+                    and request['goal_pose']!=plan['original_goal'])
+
+    def _offer_next(self,p,mission,model,request,plan,index,deadline):
+        if index+1>=len(plan['sequence']): return []
+        current=GoalPose(*plan['sequence'][index]['goal'])
+        if p.ego.speed>model.tolerances[2] or not self._near(p.ego.x,p.ego.y,p.ego.heading,current,model.tolerances):
+            return []
+        next_segment=plan['sequence'][index+1]
+        search=copy.deepcopy(model.search)
+        if search.lattice_search is not None:
+            search.lattice_search.permitted_directions=(next_segment['direction'],)
+            search.lattice_search.max_direction_changes=0
+        remaining=model.budget.max_checks
+        work=ValidationBudget(remaining,model.budget.max_depth,model.budget.min_interval_s,
+                             model.budget.deadline_monotonic_s)
+        result=plan_parking_candidate(p,mission.space_id,'ALIGN',next_segment['goal'],next_segment['direction'],
+            model.initial_curvature_m_inv,request['speed_cap_mps'],model.vehicle,model.limits,search,work,
+            model.prediction_envelopes,mission.road_lane_ids,mission.access_edge_index,self.clock,
+            model.geometry_cache,intermediate_segment=index+1<len(plan['sequence'])-1)
+        model.budget.max_checks-=result.get('checks',0)
+        if result['status']!='safe': return []
+        fresh=min(deadline,result['source_valid_until_s'])
+        require(self.clock()<fresh,'PARKING_NEXT_SEGMENT_OFFER_EXPIRED')
+        plan['offered_index'],plan['offered_until']=index+1,fresh
+        return [self._option(request['intent_id'],index+1,plan['sequence'],mission,request['speed_cap_mps'],fresh)]
 
     def _stationary(self,p,mission,model,in_bay):
         scene=read_parking_scene(p,mission.space_id,mission.road_lane_ids,bool(in_bay),
@@ -94,10 +182,12 @@ class ParkingBehaviorPlanner(object):
         checks=[(scene['access_corridor'],predictions),(scene['coverage'],[])]
         if in_bay is not None: checks.append((scene['goal_corridor'],[]))
         for region,objects in checks:
-            result=work.validate(points,model.vehicle,model.limits,region,objects,-1 if in_bay else 1)
+            result=work.validate(points,model.vehicle,model.limits,region,objects,-1 if in_bay else 1,
+                                 model.execution_envelope)
             require(result['status']=='safe',result['reason_code'])
         return dict(status='safe',points=points,stop_distance=0.,frame_id=p.frame_id,
-                    source_valid_until_s=scene['source_valid_until_s'],map_digest=scene['map_digest'])
+                    source_valid_until_s=scene['source_valid_until_s'],map_digest=scene['map_digest'],
+                    checks=work.count,execution_robust=model.execution_envelope is not None)
 
     def _moving(self,p,mission,model,request,pose,cap,previous):
         # Keep the original rear-axle position. A stop accepts the explicitly
@@ -147,7 +237,8 @@ class ParkingBehaviorPlanner(object):
             result=plan_parking_candidate(p,mission.space_id,request['stage'],(pose.x,pose.y,heading),
                 request['motion_direction'],model.initial_curvature_m_inv,cap,model.vehicle,model.limits,
                 model.search,work,model.prediction_envelopes,mission.road_lane_ids,
-                mission.access_edge_index,self.clock,model.geometry_cache)
+                mission.access_edge_index,self.clock,model.geometry_cache,
+                intermediate_segment=self._intermediate(request))
             checks+=result.get('checks',0)
             if result['status']=='safe':
                 result['checks']=checks
@@ -183,7 +274,8 @@ class ParkingBehaviorPlanner(object):
         try:
             require(used<model.budget.max_checks,'BUDGET_EXHAUSTED')
             scene=read_parking_scene(p,mission.space_id,mission.road_lane_ids,
-                request['stage'] in ('REVERSE_ENTRY','ALIGN'),mission.access_edge_index,self.clock,model.geometry_cache)
+                None if self._intermediate(request) else request['stage'] in ('REVERSE_ENTRY','ALIGN'),
+                mission.access_edge_index,self.clock,model.geometry_cache)
             remaining=ValidationBudget(model.budget.max_checks-used,model.budget.max_depth,
                 model.budget.min_interval_s,min(model.budget.deadline_monotonic_s,
                     time.monotonic()+scene['source_valid_until_s']-self.clock()))
@@ -194,18 +286,18 @@ class ParkingBehaviorPlanner(object):
             for i in range(count+1): work.step(); shape.append(at(distance*i/count))
             shape[0]=(p.ego.x,p.ego.y,p.ego.heading)
             lengths=[math.hypot(b[0]-a[0],b[1]-a[1]) for a,b in zip(shape,shape[1:])]
-            points=_timed(shape,lengths,p.ego.speed,cap,cap,curvature,model.vehicle,model.limits,
-                          work,direction,True,allow_initial_overspeed=True)
             predictions=_source_predictions(scene['objects'],model.prediction_envelopes,self.clock())
+            points,timing=_timed_parking(shape,lengths,p.ego.speed,cap,cap,curvature,model.vehicle,model.limits,
+                          model.search,work,direction,scene['access_corridor'],scene['coverage'],predictions)
             for region,objects,path in ((scene['access_corridor'],predictions,points),
                 (scene['coverage'],[],points),(scene['goal_corridor'],[],
                     [TrajectoryPoint(end[0],end[1],0.,end[2],t) for t in (0.,1.)])):
-                result=work.validate(path,model.vehicle,model.limits,region,objects,direction)
+                result=work.validate(path,model.vehicle,model.limits,region,objects,direction,model.execution_envelope)
                 if result['status']!='safe':
                     report['reason_code']=result['reason_code']; return report
             report.update(status='safe',reason_code='PARKING_ORIGINAL_ARRIVAL_REGION_CAPTURE',
                 points=points,stop_distance=sum(lengths),source_valid_until_s=scene['source_valid_until_s'],
-                map_digest=scene['map_digest'],frame_id=p.frame_id)
+                map_digest=scene['map_digest'],frame_id=p.frame_id,execution_robust=timing['execution_robust'])
         except (_Failure,ValueError) as error:
             report['reason_code']=error.code if isinstance(error,_Failure) else str(error)
         finally: report['checks']=work.count if work else 0
@@ -218,7 +310,7 @@ class ParkingBehaviorPlanner(object):
         Four spatial anchor choices use the existing search resolution; P02
         checks the entire actual-to-reference bridge and remaining path.
         """
-        in_bay=request['stage'] in ('REVERSE_ENTRY','ALIGN')
+        in_bay=None if self._intermediate(request) else request['stage'] in ('REVERSE_ENTRY','ALIGN')
         scene=read_parking_scene(p,mission.space_id,mission.road_lane_ids,in_bay,
                                 mission.access_edge_index,self.clock,model.geometry_cache)
         model.budget.deadline_monotonic_s=min(model.budget.deadline_monotonic_s,
@@ -241,30 +333,43 @@ class ParkingBehaviorPlanner(object):
                 if anchor in tried: continue
                 tried.add(anchor)
                 shape=[(p.ego.x,p.ego.y,p.ego.heading)]+list(reference[anchor:])
+                if len(shape)==2:
+                    # Preserve a launch station in a short retained tail.
+                    # Two points (tiny measured speed -> zero) otherwise
+                    # encode braking only and strand the real controller
+                    # outside the unchanged arrival region. This refines the
+                    # same chord; the current speed and P02 proof stay intact.
+                    a,b=shape
+                    shape.insert(1,((a[0]+b[0])*.5,(a[1]+b[1])*.5,
+                        normalize_angle(a[2]+.5*normalize_angle(b[2]-a[2]))))
                 if len(shape)>model.search.max_points: continue
                 lengths=[math.hypot(b[0]-a[0],b[1]-a[1]) for a,b in zip(shape,shape[1:])]
                 if not lengths or min(lengths)<=1e-9: continue
                 try:
-                    points=_timed(shape,lengths,p.ego.speed,cap,cap,model.initial_curvature_m_inv,
-                        model.vehicle,model.limits,work,request['motion_direction'],True,allow_initial_overspeed=True)
+                    points,timing=_timed_parking(shape,lengths,p.ego.speed,cap,cap,model.initial_curvature_m_inv,
+                        model.vehicle,model.limits,model.search,work,request['motion_direction'],
+                        scene['access_corridor'],scene['coverage'],predictions)
                     legal=work.validate(points,model.vehicle,model.limits,scene['access_corridor'],
-                                        predictions,request['motion_direction'])
+                                        predictions,request['motion_direction'],model.execution_envelope)
                     if legal['status']!='safe':
                         require(legal['reason_code']!='BUDGET_EXHAUSTED','BUDGET_EXHAUSTED')
                         continue
-                    visible=work.validate(points,model.vehicle,model.limits,scene['coverage'],[],request['motion_direction'])
+                    visible=work.validate(points,model.vehicle,model.limits,scene['coverage'],[],request['motion_direction'],
+                                          model.execution_envelope)
                     if visible['status']!='safe':
                         require(visible['reason_code']!='BUDGET_EXHAUSTED','BUDGET_EXHAUSTED')
                         continue
                     end=points[-1]
                     probe=[TrajectoryPoint(end.x,end.y,0.,end.heading,at) for at in (0.,1.)]
-                    target=work.validate(probe,model.vehicle,model.limits,scene['goal_corridor'],[],request['motion_direction'])
+                    target=work.validate(probe,model.vehicle,model.limits,scene['goal_corridor'],[],request['motion_direction'],
+                                         model.execution_envelope)
                     if target['status']!='safe':
                         require(target['reason_code']!='BUDGET_EXHAUSTED','BUDGET_EXHAUSTED')
                         continue
                     report.update(status='safe',reason_code='PARKING_REMAINDER_READY',points=points,
                         stop_distance=sum(lengths),source_valid_until_s=scene['source_valid_until_s'],
-                        map_digest=scene['map_digest'],frame_id=p.frame_id,retained_reference=True)
+                        map_digest=scene['map_digest'],frame_id=p.frame_id,retained_reference=True,
+                        execution_robust=timing['execution_robust'])
                     break
                 except _Failure as error:
                     if error.code=='BUDGET_EXHAUSTED': raise
@@ -292,6 +397,8 @@ class ParkingBehaviorPlanner(object):
                 'PARKING_OVERRIDDEN_BY_STOP')
             require(signal_stop_requirement(p) is None,'PARKING_SIGNAL_STOP_REQUIRED')
             model=read_inputs(self.provider,p,context,self.clock,'PARKING',ParkingPlanningInputs)
+            model.search.execution_envelope=copy.deepcopy(model.execution_envelope)
+            model.search.dynamic_search=copy.deepcopy(model.dynamic_search)
             _search_parameters(model.search)
             _motion_parameters((p.ego.x,p.ego.y,p.ego.heading),p.ego.speed,model.initial_curvature_m_inv,
                 request['speed_cap_mps'],model.vehicle,model.limits,model.budget,allow_initial_overspeed=True)
@@ -309,21 +416,31 @@ class ParkingBehaviorPlanner(object):
             facts=ManeuverFacts(p,self.clock); digest=facts.map_digest()
             require(mission.map_digest==digest,'PARKING_MISSION_MAP_MISMATCH')
             bay=facts.parking(mission.space_id)
-            pose=mission.stage_pose(stage,bay,model.vehicle.front_offset_m,model.vehicle.rear_offset_m)
-            require(request['parking_space_id']==mission.space_id and request['goal_pose']==pose.to_dict(),
-                    'PARKING_ORIGINAL_STAGE_GOAL_MISMATCH')
+            original_pose=mission.stage_pose(stage,bay,model.vehicle.front_offset_m,model.vehicle.rear_offset_m)
+            require(request['parking_space_id']==mission.space_id,'PARKING_ORIGINAL_STAGE_GOAL_MISMATCH')
             for name,actual in (('front_offset_m',model.vehicle.front_offset_m),
                 ('rear_offset_m',model.vehicle.rear_offset_m),('half_width_m',model.vehicle.half_width_m),
                 ('wheelbase_m',model.vehicle.wheelbase_m),('front_steer_max_rad',model.limits.max_front_steer_rad)):
                 supplied=getattr(settings,name)
                 require(supplied is None or abs(supplied-actual)<=1e-9,'PARKING_CONTROL_GEOMETRY_MISMATCH')
             binding=(mission.binding(bay),model.model_id,tuple(sorted(vars(model.vehicle).items())),
-                     tuple(sorted(vars(model.limits).items())),model.tolerances)
-            if self.context!=context.key(): self.context,self.records=context.key(),{}
+                     tuple(sorted(vars(model.limits).items())),model.tolerances,
+                     None if model.execution_envelope is None else tuple(sorted(vars(model.execution_envelope).items())),
+                     model.speed_error_mps)
+            if self.context!=context.key(): self.context,self.records,self.segment_plans=context.key(),{},{}
             intent=request['intent_id']; previous=self.records.get(intent)
             require(previous is None or previous['binding']==binding,'PARKING_ACTIVE_BINDING_CHANGED')
             require(previous is not None or len(self.records)<128,'PARKING_SESSION_CAPACITY')
+            sequence,index,candidate_id=None,None,None
+            if request.get('candidate_id') is not None:
+                require(stage=='ALIGN','PARKING_SEGMENT_REQUIRES_ALIGNMENT_STAGE')
+                sequence,index,pose=self._authorized_segment(request,binding,now)
+                candidate_id=sequence['sequence'][index]['candidate_id']
+            else:
+                pose=original_pose
+                require(request['goal_pose']==pose.to_dict(),'PARKING_ORIGINAL_STAGE_GOAL_MISMATCH')
             self._transition(p,request,previous,feedbacks,context)
+            if sequence is not None: sequence['authorized_index']=index
             deadline=min(deadline,request['valid_until_s'],caps.valid_until_s,model.valid_until_s,
                          mission.evidence.valid_until_s)
             model.budget.deadline_monotonic_s=min(model.budget.deadline_monotonic_s,
@@ -331,9 +448,34 @@ class ParkingBehaviorPlanner(object):
             stopped=p.ego.speed<=model.tolerances[2] and self._near(p.ego.x,p.ego.y,p.ego.heading,pose,model.tolerances)
             require(not hold or stopped,'PARKING_HOLD_REQUIRES_ACTUAL_PARKED_POSE')
             if stopped:
-                result=self._stationary(p,mission,model,stage not in ('APPROACH','POSITION','EXIT'))
+                result=self._stationary(p,mission,model,None if self._intermediate(request)
+                    else stage not in ('APPROACH','POSITION','EXIT'))
             else:
                 result=self._moving(p,mission,model,request,pose,min(decision.target_speed,request['speed_cap_mps']),previous)
+            if result.get('reason_code')=='PARKING_SEGMENT_AUTHORIZATION_REQUIRED':
+                deadline=min(deadline,result['source_valid_until_s'])
+                option=self._propose_segments(p,mission,model,request,result,binding,deadline)
+                remaining=model.budget.max_checks-result.get('checks',0)
+                require(remaining>0,'BUDGET_EXHAUSTED')
+                model.budget.max_checks=remaining
+                hold_result=self._stationary(p,mission,model,None)
+                deadline=min(deadline,hold_result['source_valid_until_s'])
+                require(self.clock()<deadline,'PARKING_SEGMENT_PROPOSAL_EXPIRED')
+                option['source_valid_until_s']=deadline
+                self.segment_plans[intent]['offered_until']=deadline
+                output.reason='PARKING_SEGMENT_AUTHORIZATION_REQUIRED'
+                output.valid_until=deadline; output.points=hold_result['points']; output.target_speed=0.
+                output.motion_direction=request['motion_direction']; output.precision_stop=True
+                output.stop_required=True; output.stop_distance=0.; output.valid=True
+                output.planning_metrics={'parking_segment_proposal':True}
+                output.behavior_feedback=self._reply(context,request,p,self.clock(),deadline,'REJECTED',
+                    output.reason,options=[option],metrics={'parking_segment_proposal':True})
+                self.records[intent]=dict(binding=binding,revision=(request['revision'],stage,
+                    request['source_frame_id'],request['issued_at_s']),pose=pose,dwell=0.,
+                    tolerances=model.tolerances,direction=request['motion_direction'],accepted=False,
+                    segment_proposal=True,proposal_start_pose=GoalPose(p.ego.x,p.ego.y,p.ego.heading))
+                validate_output(output,Trajectory,decision)
+                return output
             preparing=(result['status']!='safe' and result.get('reason_code')=='NO_CERTIFIED_PARKING_SEGMENT'
                 and p.ego.speed<=model.tolerances[2] and model.initial_curvature_m_inv!=0.)
             if preparing:
@@ -356,6 +498,7 @@ class ParkingBehaviorPlanner(object):
                 output.motion_direction=request['motion_direction']; output.precision_stop=True
                 output.stop_required=True; output.stop_distance=0.; output.valid=True
                 output.reason='PARKING_STOPPED_STEERING_PREPARATION'
+                output.planning_metrics={'parking_stopped_steering_preparation':True}
                 validate_output(output,Trajectory,decision)
                 self.records[intent]=dict(binding=binding,revision=(request['revision'],stage,
                     request['source_frame_id'],request['issued_at_s']),pose=pose,dwell=0.,
@@ -369,12 +512,30 @@ class ParkingBehaviorPlanner(object):
             output.parking_brake_at_stop=request['parking_brake_at_stop']
             output.stop_obligation_id=request['stop_obligation_id'] or ''
             output.behavior_identity={key:request[key] for key in ('intent_id','stage','revision')}
-            output.behavior_feedback=self._reply(context,request,p,now,deadline,'PLANNED','PARKING_STAGE_PATH_READY')
+            model.budget.max_checks-=result.get('checks',0)
+            options=self._offer_next(p,mission,model,request,sequence,index,deadline) if sequence is not None else []
+            if candidate_id is None:
+                # The same authorized stage keeps one ID and original goal
+                # across replans. A new GPS frame is not a new progress task.
+                token=repr((intent,request['revision'],stage,request['goal_pose'],request['motion_direction']))
+                candidate_id='parking:'+hashlib.sha256(token.encode('utf-8')).hexdigest()[:24]
+            output.candidate_id=candidate_id
+            output.planning_metrics=dict(parking_segment=sequence is not None,
+                segment_index=index,segment_count=len(sequence['sequence']) if sequence else 1,
+                original_parking_goal=original_pose.to_dict(),checks=result.get('checks',0),
+                execution_robust=bool(result.get('execution_robust',False)))
+            if model.execution_envelope is not None and model.execution_envelope.position_error_m>0:
+                output.planning_metrics['progress_bounds']=dict(max_speed_mps=model.limits.max_speed_mps,
+                    max_acceleration_mps2=model.limits.max_acceleration_mps2,
+                    position_tolerance_m=model.execution_envelope.position_error_m)
+            output.behavior_feedback=self._reply(context,request,p,now,deadline,'PLANNED','PARKING_STAGE_PATH_READY',
+                candidate_id=candidate_id,options=options,metrics=output.planning_metrics)
             output.reason='SOURCE_BOUND_PARKING_STAGE'; output.valid=True
             validate_output(output,Trajectory,decision)
             self.records[intent]=dict(binding=binding,revision=(request['revision'],stage,request['source_frame_id'],
                 request['issued_at_s']),pose=pose,dwell=request['minimum_standstill_duration_s'],
                 tolerances=model.tolerances,direction=request['motion_direction'],accepted=True,
+                candidate_id=candidate_id,segment_candidate=sequence is not None,
                 endpoint_heading=output.points[-1].heading,reference=(previous['reference']
                     if result.get('retained_reference') else tuple((v.x,v.y,v.heading) for v in output.points)))
             return output

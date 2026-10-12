@@ -10,15 +10,20 @@ from core.behavior_channel import read_channel
 from core.maneuver_facts import ManeuverFacts
 from members.decision.behaviors.environment import lane_candidates
 from members.decision.behaviors.parking_runtime import ParkingRuntime
+from members.decision.behaviors.lane_change_runtime import LaneChangeRuntime
+from members.decision.behaviors.driving_runtime import DrivingRuntime
 from members.decision.behaviors.stop_policies import (
     SignalDwellPolicy, SignalStopObservation, BlockedRoadPolicy, BlockingObservation,
 )
 
 
 class BehaviorCoordinator(object):
-    def __init__(self, settings, clock=None,parking_inputs_provider=None):
+    def __init__(self, settings, clock=None,parking_inputs_provider=None,lane_change_inputs_provider=None,
+                 driving_inputs_provider=None):
         self.settings, self.clock = settings, clock or time.monotonic
         self.parking_inputs_provider=parking_inputs_provider
+        self.lane_change_inputs_provider=lane_change_inputs_provider
+        self.driving_inputs_provider=driving_inputs_provider
         self._generation = 0
         self.reset()
 
@@ -33,6 +38,8 @@ class BehaviorCoordinator(object):
         self.signal = SignalDwellPolicy(self.settings.signal_dwell_duration_s, self._session())
         self.blocked = BlockedRoadPolicy(self.settings.release_frames, self._session())
         self.parking=ParkingRuntime(self.parking_inputs_provider,self._session,self.clock)
+        self.lane_changes=LaneChangeRuntime(self.lane_change_inputs_provider,self._session,self.clock,self.settings)
+        self.driving=DrivingRuntime(self.driving_inputs_provider,self._session,self.clock,self.settings)
         self._signal_seen = set()
         self._runtime_context = None
         self._blockage_anchor = None
@@ -162,14 +169,28 @@ class BehaviorCoordinator(object):
                     and session.status not in ("COMPLETED","CANCELLED"))
 
     def execution_pending(self):
-        return self.signal_pending() or self.parking.pending()
+        return (self.signal_pending() or self.driving.pending() or self.parking.pending()
+                or self.lane_changes.pending())
+
+    def apply_driving(self,perception,output):
+        self.driving.apply(perception,output,priority=self.signal_pending())
+        if self.driving.provider is not None or self.driving.pending():
+            self._latest['driving']=self.driving.snapshot()
 
     def apply_parking(self,perception,output):
         priority=(self.signal_pending() or signal_stop_requirement(perception) is not None
+                  or self.driving.pending() or self.lane_changes.pending()
                   or output.mode=='EMERGENCY_BRAKE' or output.behavior_request is not None)
         self.parking.apply(perception,output,priority)
         if self.parking.provider is not None or self.parking.pending():
             self._latest['parking']=self.parking.snapshot()
+
+    def apply_lane_change(self,perception,output,constraints):
+        priority=(self.signal_pending() or self.driving.pending() or self.parking.claimed or self.parking.pending()
+                  or output.behavior_request is not None)
+        self.lane_changes.apply(perception,output,constraints,priority)
+        if self.lane_changes.provider is not None:
+            self._latest['lane_change']=self.lane_changes.snapshot()
 
     def diagnostic_error(self, frame_id, reason):
         self._latest = dict(interface_status="proposal_not_runtime_connected", frame_id=frame_id,

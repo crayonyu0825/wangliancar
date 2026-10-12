@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -12,8 +13,8 @@ from runtime import CaptainRuntime
 
 
 class RuntimeLaunchTests(unittest.TestCase):
-    @unittest.skipUnless(os.name == "nt" and os.path.isfile(
-        r"E:\Sim-One\Tools\python36\python.exe"), "requires local SimOne Python on Windows")
+    @unittest.skipUnless(os.name == "nt" and sys.version_info[:2]==(3,6),
+                         "requires Windows target Python 3.6")
     def test_platform_batch_applies_30_kmh_default_and_preserves_overrides(self):
         project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         fixture = (
@@ -41,6 +42,7 @@ class RuntimeLaunchTests(unittest.TestCase):
                     with open(os.path.join(directory, "config", "local.ini"), "w") as stream:
                         stream.write("[app]\n")
                 environment = os.environ.copy()
+                environment['NEVC_PYTHON_EXE']=sys.executable
                 environment.pop("NEVC_DECISION_CRUISE_SPEED", None)
                 environment.pop("NEVC_VEHICLE_FRONT_OFFSET_M", None)
                 environment.pop("NEVC_VEHICLE_HALF_WIDTH_M", None)

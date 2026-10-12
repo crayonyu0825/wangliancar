@@ -7,6 +7,7 @@ from core.corridor_region import CorridorRegion,NumericResolution,PreparationLim
 from core.geometry import normalize_angle
 from core.parking_mission import rear_axle_bay_goal
 from members.decision.behaviors.contract import BehaviorGoal, GoalPose, finite, require
+from core.behavior_contract import FeedbackValidator,LightIntent,validate_candidate_option
 from members.decision.behaviors.observations import Evidence, MotionObject, polygon, inside, intersects, vehicle_footprint
 from members.decision.behaviors.session import BehaviorSession
 from members.decision.behaviors.stop_policies import PolicyResult
@@ -97,6 +98,10 @@ class ParkingPolicy(object):
         self._mission_key=None
         self._selected_space,self._park_pose,self._exit_pose=None,None,None
         self._last_good_goal=None
+        self._segment_goal,self._segment_id,self._segment_count=None,None,None
+        self._park_direction=-1
+        self._segment_seen,self._proposed=set(),None
+        self._proposal_validator=FeedbackValidator()
 
     @staticmethod
     def _space_key(space):
@@ -106,13 +111,15 @@ class ParkingPolicy(object):
 
     def _expected_goal(self):
         stage=self.session.stage
+        if stage=='ALIGN' and self._segment_goal is not None:
+            return copy.deepcopy(self._segment_goal)
         if stage=='APPROACH': return self._goal(self._selected_space.approach_pose)
         if stage=='POSITION': return self._goal(self._selected_space.position_pose)
         if stage=='EXIT':
             require(self._exit_pose is not None,'unbound parking exit')
             return self._goal(self._exit_pose)
         require(stage in ('REVERSE_ENTRY','ALIGN','PARKED_DWELL','EXIT_PREPARE'),'unknown parking stage')
-        return self._goal(GoalPose(*self._park_pose),-1,stage!='EXIT_PREPARE')
+        return self._goal(GoalPose(*self._park_pose),self._park_direction,stage!='EXIT_PREPARE')
 
     def rear_axle_goal(self, space):
         return rear_axle_bay_goal(space.boundary,space.body_heading_rad,self.front_m,self.rear_m)
@@ -131,6 +138,8 @@ class ParkingPolicy(object):
         return (reply is not None and reply.producer in ("control", "runtime")
                 and reply.actual_pose is not None and reply.goal_pose_arrived
                 and reply.actual_standstill_confirmed
+                and (self.session.goal.candidate_id is None or reply.candidate_id==self.session.goal.candidate_id)
+                and reply.motion_direction==self.session.goal.motion_direction
                 and math.hypot(reply.actual_pose.x - goal.x, reply.actual_pose.y - goal.y) <= self.position_tolerance_m
                 and abs(normalize_angle(reply.actual_pose.body_heading_rad - goal.body_heading_rad)) <= self.heading_tolerance_rad
                 and frame.ego_speed<=self.standstill_speed_mps
@@ -143,6 +152,45 @@ class ParkingPolicy(object):
                             precision_stop=True, minimum_standstill_duration_s=self.dwell_s if dwell else 0.0,
                             parking_brake_at_stop=dwell,
                             stop_obligation_id="parking:" + str(self.space.identifier) if dwell else None)
+
+    def offer_candidate_options(self,frame,reply):
+        """Planning suggests a path; actual stop proof decides stage movement."""
+        self._proposed=None
+        if self.session.intent_id is None or reply is None or reply.producer!='planning': return
+        usable,unused,unused=self._proposal_validator.check(reply,self.session.snapshot(frame),frame)
+        if not usable: return
+        candidates=[]
+        for option in reply.candidate_options:
+            try:
+                validate_candidate_option(option,reply.valid_until_s)
+                goal=option['goal']
+                require(option['action']=='PARK' and option['feasible']
+                    and frame.observed_at_s<option['source_valid_until_s']
+                    and option['candidate_id']==option['segment_id']==goal.get('candidate_id')
+                    and goal['parking_space_id']==self.space.identifier and goal['goal_pose'] is not None
+                    and goal['precision_stop'] and goal['minimum_standstill_duration_s']==0.
+                    and not goal['parking_brake_at_stop'] and goal['stop_obligation_id'] is None
+                    and goal['speed_cap_mps']>0 and goal['speed_cap_mps']<=self.speed_cap_mps
+                    and option['candidate_id'] not in self._segment_seen
+                    and (self._segment_count is None or option['segment_count']==self._segment_count),
+                    'PARKING_SEGMENT_PROPOSAL_NOT_CURRENT')
+                candidates.append(copy.deepcopy(option))
+            except (ValueError,TypeError,KeyError): continue
+        if candidates:
+            self._proposed=min(candidates,key=lambda item:(item['risk_cost']+item['rule_cost'],item['candidate_id']))
+
+    def _select_segment(self,frame,option):
+        data=copy.deepcopy(option['goal'])
+        raw=data.pop('goal_pose'); lights=data.pop('light_intent')
+        data['goal_pose']=GoalPose(raw['x'],raw['y'],raw['body_heading_rad'])
+        data['light_intent']=LightIntent(**lights)
+        goal=BehaviorGoal(**data)
+        self._segment_goal,self._segment_id=copy.deepcopy(goal),option['candidate_id']
+        self._segment_count=option['segment_count']; self._segment_seen.add(self._segment_id)
+        require(len(self._segment_seen)<=self._segment_count<=128,'PARKING_SEGMENT_SEQUENCE_LIMIT')
+        required=('PARK','PATH','FEEDBACK')+ (('REVERSE',) if goal.motion_direction==-1 else ())
+        return self.session.advance(frame,'ALIGN',goal,required=required,
+                                    reason='ACTUAL_STOP_AUTHORIZES_PARKING_SEGMENT',force_revision=True)
 
     def evaluate(self, frame, facts, capabilities=None, feedback=None, safety_override=False, intent_key="park"):
         if not frame.current(frame.observed_at_s):
@@ -224,7 +272,8 @@ class ParkingPolicy(object):
         # boundaries. A refined observation must not certify the old geometry.
         if ((self.session.stage != "EXIT" and not self._body_clear(self.park_goal, facts, observed_space))
                 or not self._body_clear(self.session.goal.goal_pose, facts,
-                    observed_space if self.session.stage in ("REVERSE_ENTRY", "ALIGN", "PARKED_DWELL") else None)):
+                    observed_space if self.session.stage in ("REVERSE_ENTRY", "ALIGN", "PARKED_DWELL")
+                    and self._segment_goal is None else None)):
             request = self.session.block(frame, "NEW_PARKING_GOAL_OBSTRUCTION")
             return PolicyResult(request, True, request.reason_code, "BLOCKED")
         if (self.session.status == "BLOCKED" and self.session.reason_code in
@@ -234,10 +283,20 @@ class ParkingPolicy(object):
                 old = self.session.goal
                 self.session.goal = self._goal(old.goal_pose, old.motion_direction,
                                               old.minimum_standstill_duration_s > 0)
-        authorized_reverse = self.session.stage in ("REVERSE_ENTRY", "ALIGN") and self.session.status in ("ACCEPTED", "EXECUTING")
+        authorized_reverse = (self.session.stage in ("REVERSE_ENTRY", "ALIGN")
+            and self.session.goal.motion_direction==-1 and self.session.status in ("ACCEPTED", "EXECUTING"))
         if facts.signed_body_speed_mps < -0.05 and not authorized_reverse:
             request = self.session.tick(frame, capabilities, safety_override=True)
             return PolicyResult(request, True, "UNEXPECTED_REVERSE_MOTION", "RECOVER")
+        proposal=self._proposed
+        initial_segment=(proposal is not None and self._segment_id is None
+            and self.session.stage=='REVERSE_ENTRY' and self.session.status not in ('BLOCKED','SUSPENDED','CANCELLED')
+            and frame.ego_speed<=self.standstill_speed_mps
+            and math.hypot(frame.ego_x-self.space.position_pose.x,frame.ego_y-self.space.position_pose.y)<=self.position_tolerance_m
+            and abs(normalize_angle(frame.ego_heading-self.space.position_pose.body_heading_rad))<=self.heading_tolerance_rad)
+        if initial_segment and not safety_override:
+            self._select_segment(frame,proposal)
+            feedback=None
         request = self.session.tick(frame, capabilities, feedback, safety_override)
         if request.status == "COMPLETED":
             return PolicyResult(request, False, request.reason_code, "COMPLETE")
@@ -257,13 +316,23 @@ class ParkingPolicy(object):
                                            reason="ENTRY_POSITION_ACTUALLY_STOPPED")
         elif stage in ("REVERSE_ENTRY", "ALIGN"):
             if parked:
-                request = self.session.advance(frame, "PARKED_DWELL", self._goal(self.park_goal, -1, True), reason="WHOLE_BODY_ACTUALLY_PARKED")
+                self._park_direction=self.session.goal.motion_direction
+                request = self.session.advance(frame, "PARKED_DWELL", self._goal(self.park_goal,
+                    self.session.goal.motion_direction, True),
+                    required=('PARK','PATH','DWELL','FEEDBACK')+(('REVERSE',) if self._park_direction==-1 else ()),
+                    reason="WHOLE_BODY_ACTUALLY_PARKED")
+                self._segment_goal=None
+            elif (stage=='ALIGN' and proposal is not None and not safety_override
+                    and self._arrived(reply,self.session.goal.goal_pose,frame)
+                    and reply.candidate_id==self._segment_id):
+                request=self._select_segment(frame,proposal)
             elif (reply is not None and reply.producer in ("control", "runtime")
                   and reply.actual_standstill_confirmed and reply.progress >= 1.0 and stage == "REVERSE_ENTRY"):
                 request = self.session.advance(frame, "ALIGN", self._goal(self.park_goal, -1, True), reason="PARKING_POSE_ALIGNMENT_REQUIRED")
         elif stage == "PARKED_DWELL":
             if parked and reply.hold_completed and reply.standstill_duration_s >= self.dwell_s:
-                request = self.session.advance(frame, "EXIT_PREPARE", self._goal(self.park_goal, -1), reason="TEN_SECOND_DWELL_ACTUALLY_COMPLETED")
+                request = self.session.advance(frame, "EXIT_PREPARE", self._goal(self.park_goal,
+                    self.session.goal.motion_direction), reason="TEN_SECOND_DWELL_ACTUALLY_COMPLETED")
         elif stage == "EXIT_PREPARE":
             if (parked and facts.exit_goal is not None
                     and self._body_clear(facts.exit_goal, facts)):

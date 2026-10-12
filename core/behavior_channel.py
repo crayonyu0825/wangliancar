@@ -6,6 +6,7 @@ import uuid
 
 from core.behavior_contract import (CONTRACT_VERSION, TaskContext, Capabilities,
                                     ExecutionFeedback, GoalPose, finite, require)
+from core.maneuver_progress import ProgressTracker
 
 CHANNEL_VERSION = "behavior-channel-v1"
 
@@ -29,7 +30,11 @@ def feedback_dict(value):
 
 
 def feedback_from_dict(value):
-    require(isinstance(value,dict) and set(value)==set(ExecutionFeedback.__slots__), "invalid channel feedback")
+    optional = {'lights_command_duration_s', 'lights_evidence_level', 'candidate_options',
+                'planning_metrics', 'evidence_level', 'command_send_status', 'gear_confirmed',
+                'actual_brake_stop_confirmed'}
+    require(isinstance(value,dict) and set(ExecutionFeedback.__slots__) - optional <= set(value)
+            and set(value) <= set(ExecutionFeedback.__slots__), "invalid channel feedback")
     data = copy.deepcopy(value)
     data["context"] = context_from_dict(data["context"])
     pose = data["actual_pose"]
@@ -74,6 +79,18 @@ class BehaviorTransport(object):
         self.scope,self.context,self.frame,self.feedbacks = None,None,None,[]
         self._progress = {}
         self._motion_progress = {}
+        self._path_progress = ProgressTracker()
+        self._path_bounds,self._path_goals = {},{}
+
+    def reset_session(self):
+        """Captain-only reset after establishing a new SDK case/session.
+
+        A member request or a backwards GPS frame cannot authorize this reset.
+        """
+        self.scope,self.context,self.frame = None,None,None
+        self.feedbacks,self._progress,self._motion_progress = [],{},{}
+        self._path_progress.reset()
+        self._path_bounds,self._path_goals = {},{}
 
     def prepare(self,p):
         now = self.clock()
@@ -86,10 +103,16 @@ class BehaviorTransport(object):
             self.feedbacks = []
             return
         scope = (p.case_id,p.task_id,p.scene_id)
-        if (scope!=self.scope or (self.frame is not None and p.frame_id<self.frame)):
+        if self.context is not None and (scope!=self.scope or
+                self.frame is not None and p.frame_id<self.frame):
+            p.behavior_channel = {}
+            return
+        if self.context is None:
             self.scope,self.context = scope,TaskContext(*(scope+("runtime:"+uuid.uuid4().hex,)))
             self.feedbacks,self._progress = [],{}
             self._motion_progress = {}
+            self._path_progress.reset()
+            self._path_bounds,self._path_goals = {},{}
         self.frame = p.frame_id
         caps = Capabilities(self.context,self.actions,now,p.valid_until,usable=bool(self.actions))
         p.behavior_channel = dict(contract_version=CHANNEL_VERSION,context=self.context.to_dict(),
@@ -114,17 +137,74 @@ class BehaviorTransport(object):
         if isinstance(trajectory.behavior_feedback,dict):
             records.append(copy.deepcopy(trajectory.behavior_feedback))
         identity = {key:request[key] for key in ("intent_id","stage","revision")}
-        usable = bool(p.valid and control.valid and trajectory.valid and now<min(p.valid_until,control.valid_until))
+        usable = bool(p.valid and control.valid and trajectory.valid and
+                      now<min(p.valid_until,control.valid_until,trajectory.valid_until,request['valid_until_s']))
         if usable:
             observation = control.execution_observation
             actual = isinstance(observation,dict) and observation.get("identity")==identity
+            metrics=getattr(trajectory,'planning_metrics',{})
+            bounded=isinstance(metrics,dict) and 'progress_bounds' in metrics
+            gps=p.source_status.get('gps',{}) if isinstance(p.source_status,dict) else {}
+            current_gps=bool(p.ego.valid is True and p.ego.frame_id==p.frame_id and p.ego.timestamp==p.timestamp
+                and isinstance(gps,dict) and gps.get('usable') is True
+                and gps.get('quality') not in ('stale','invalid','regressed','unsynchronized','timing_unknown'))
+            gps_actual=bool(bounded and trajectory.behavior_identity==identity and current_gps)
             failed = safety_active or (isinstance(receipt,dict) and receipt.get("attempted") is True
                                       and receipt.get("ok") is not True)
-            if actual or failed:
+            if actual or gps_actual or failed:
                 key = (request["intent_id"],request["revision"])
                 initial = self._progress.setdefault(key,max(0.,request["stop_distance_m"]))
                 progress = max(0.,min(1.,1.-max(0.,request["stop_distance_m"])/initial)) if initial>0 else 0.
-                if (actual and ((request.get('maneuver') in ('LANE_CHANGE','AVOID','OVERTAKE','MERGE')
+                evidence='legacy_gps_controller_observed'
+                progress_metrics={}
+                progress_reason='GPS_CONTROLLER_OBSERVED'
+                progress_failed=False
+                moving_path=bool(isinstance(trajectory.points,(list,tuple)) and len(trajectory.points)>1
+                    and any(math.hypot(b.x-a.x,b.y-a.y)>1e-9 for a,b in zip(trajectory.points,trajectory.points[1:])))
+                if bounded and not gps_actual:
+                    failed=True; progress=0.; progress_reason='PROGRESS_GPS_UNAVAILABLE'
+                    progress_failed=True
+                    evidence='gps_path_progress_rejected'
+                elif bounded and (actual or gps_actual) and moving_path:
+                    try:
+                        identifier=getattr(trajectory,'candidate_id',None)
+                        bounds=metrics['progress_bounds']
+                        require(isinstance(identifier,str) and bool(identifier) and isinstance(bounds,dict)
+                                and set(bounds)=={'max_speed_mps','max_acceleration_mps2','position_tolerance_m'}
+                                and all(finite(v) and v>0 for v in bounds.values()),'PROGRESS_BOUNDS_REQUIRED')
+                        expected=request.get('candidate_id')
+                        require(expected is None or expected==identifier,'PROGRESS_CANDIDATE_ID_MISMATCH')
+                        # Freeze the original path and physical bounds. Later
+                        # replans cannot shorten its length or enlarge its
+                        # reachable prefix to manufacture task completion.
+                        new=identifier not in self._path_bounds
+                        require(new or self._path_goals[identifier]==request.get('goal_pose'),'PROGRESS_ORIGINAL_GOAL_CHANGED')
+                        frozen=copy.deepcopy(bounds) if new else self._path_bounds[identifier]
+                        require(finite(p.ego.speed) and 0<=p.ego.speed<=frozen['max_speed_mps'],
+                                'PROGRESS_ACTUAL_SPEED_OUTSIDE_LIMITS')
+                        environment=getattr(p,'maneuver_environment',None)
+                        observed=(environment.observed_at_s if getattr(environment,'valid',False) is True
+                                  else gps.get('observed_at_s',now))
+                        require(finite(observed) and 0<=observed<=now,'PROGRESS_FUTURE_OBSERVATION')
+                        tracked=self._path_progress.observe(identifier,trajectory.points,
+                            (p.ego.x,p.ego.y,p.ego.heading),p.ego.speed,p.frame_id,observed,**frozen)
+                        if new:
+                            self._path_bounds[identifier]=frozen
+                            self._path_goals[identifier]=copy.deepcopy(request.get('goal_pose'))
+                        progress=tracked['progress']
+                        progress_metrics={'actual_path_progress':tracked,'progress_bounds':copy.deepcopy(frozen)}
+                        evidence='gps_reachable_path_progress'; progress_reason=tracked['reason_code']
+                        active=set(self._path_progress.entries)
+                        for old in list(self._path_bounds):
+                            if old not in active:
+                                self._path_bounds.pop(old,None); self._path_goals.pop(old,None)
+                    except (ValueError,TypeError,AttributeError,KeyError) as error:
+                        failed=True; progress=0.; progress_reason=str(error)
+                        progress_failed=True
+                        evidence='gps_path_progress_rejected'
+                elif bounded and not moving_path:
+                    progress=0.; evidence='gps_controller_observed_stationary'
+                elif (actual and ((request.get('maneuver') in ('LANE_CHANGE','AVOID','OVERTAKE','MERGE')
                         and request['stage'] in ('EXECUTE','SETTLE')) or
                         (request.get('maneuver')=='PARK' and request['stage'] in
                          ('APPROACH','POSITION','REVERSE_ENTRY','ALIGN','PARKED_DWELL','EXIT_PREPARE','EXIT')))):
@@ -147,14 +227,47 @@ class BehaviorTransport(object):
                 arrived = bool(actual and observation.get("goal_pose_arrived") is True)
                 elapsed = observation.get("standstill_duration_s",0.) if actual else 0.
                 completed = bool(actual and observation.get("hold_completed") is True)
+                identifier=getattr(trajectory,'candidate_id',None)
+                brake_stop=bool(not failed and actual and current_gps and
+                    request.get('maneuver')=='EMERGENCY' and request['stage'] in
+                    ('EXECUTE_BRAKE','EXECUTE_LEFT','EXECUTE_RIGHT','EXECUTE_BRAKE_LEFT','EXECUTE_BRAKE_RIGHT','BRAKE_FALLBACK')
+                    and trajectory.behavior_identity==identity and isinstance(identifier,str) and identifier
+                    and request.get('candidate_id')==identifier==observation.get('candidate_id')
+                    and isinstance(metrics,dict) and metrics.get('emergency_outcome')=='verified_safe_brake_stop'
+                    and metrics.get('original_goal_pose')==request.get('goal_pose')
+                    and observation.get('actual_brake_stop_confirmed') is True
+                    and finite(p.ego.speed) and 0<=p.ego.speed<=1e-9
+                    and trajectory.stop_required is True and trajectory.target_speed==0
+                    and not trajectory.emergency_stop and isinstance(trajectory.points,(tuple,list))
+                    and 2<=len(trajectory.points)<=2000 and all(v.speed==0
+                        and math.hypot(v.x-p.ego.x,v.y-p.ego.y)<=1e-9
+                        and abs(math.atan2(math.sin(v.heading-p.ego.heading),math.cos(v.heading-p.ego.heading)))<=1e-9
+                        for v in trajectory.points)
+                    and control.throttle==0 and finite(control.brake) and control.brake>0 and control.hazard_signal is True
+                    and isinstance(receipt,dict) and receipt.get('attempted') is True and receipt.get('ok') is True)
+                if brake_stop:
+                    # Safe early braking is a measured outcome of this command,
+                    # never arrival at the unchanged original path endpoint.
+                    arrived=completed=False;elapsed=0.;progress=0.
+                    evidence='verified_actual_brake_stop'
+                    progress_reason='safe_brake_stop_observed_not_goal'
+                    progress_metrics=dict(emergency_outcome='verified_safe_brake_stop',
+                        actual_stop_pose=[p.ego.x,p.ego.y,p.ego.heading],original_goal_pose=copy.deepcopy(request.get('goal_pose')))
                 status = ("FAILED" if failed else "COMPLETED" if completed else "DWELLING" if arrived else "EXECUTING")
                 reply = ExecutionFeedback(self.context,request["intent_id"],request["stage"],request["revision"],
                     "runtime",p.frame_id,p.frame_id,now,min(p.valid_until,control.valid_until),status,
-                    usable=True,reason_code="EXECUTION_INTERRUPTED" if failed else "GPS_CONTROLLER_OBSERVED",
-                    progress=progress,actual_standstill_confirmed=bool(arrived and p.ego.speed<=.05 and not failed),
+                    usable=True,reason_code=progress_reason if progress_failed else
+                        "EXECUTION_INTERRUPTED" if failed else progress_reason,
+                    progress=progress,actual_standstill_confirmed=bool((arrived and p.ego.speed<=.05 or brake_stop) and not failed),
+                    actual_brake_stop_confirmed=brake_stop,
                     goal_pose_arrived=arrived and not failed,standstill_duration_s=elapsed if not failed else 0.,
                     hold_completed=completed and not failed,motion_direction=trajectory.motion_direction,
-                    actual_pose=GoalPose(p.ego.x,p.ego.y,p.ego.heading),actual_lane_id=p.lane.lane_id)
+                    actual_pose=GoalPose(p.ego.x,p.ego.y,p.ego.heading),actual_lane_id=p.lane.lane_id,
+                    candidate_id=getattr(trajectory,'candidate_id',None),
+                    command_send_status=('unknown' if not isinstance(receipt,dict) else
+                        'not_attempted' if receipt.get('attempted') is not True else
+                        'sent' if receipt.get('ok') is True else 'failed'),
+                    evidence_level=evidence,planning_metrics=progress_metrics)
                 records.append(feedback_dict(reply))
                 if len(self._progress)>128:
                     self._progress = {key:initial}
