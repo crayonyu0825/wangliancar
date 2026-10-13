@@ -60,3 +60,14 @@
 独立安全检查核对实际交付路径，并在每帧检查上次成功发送轨迹的实际位置、朝向与速度偏差；换道后的普通超越阶段也继续检查。只有 `attempted=true` 且 `ok=true` 的发送回执才登记已发送轨迹；安全覆盖发送不能登记原路径。发送成功不等于车辆实际执行，到位/停留/驶出使用实际反馈确认。
 
 离线合成模型验证不等于真实 SimOne 行为验收，也不建立 20 Hz 实时预算或官方评分结论。实际来源、车辆响应、算时和评分仍由对应成员与队长分别验收。
+# 决策增量：任务路线、停留规则和泊车选位
+
+在原 `behavior-inputs-v1` 确认模型文件中可选添加 `task_route`。未提供或 `enabled=false` 时不安装任务进度提供者。启用需要 `verified=true`、`verification_reference`、`route_id`、`speed_cap_mps` 和明确的 `reference_end_reason`（`task_destination / window_end / map_end / branch_ambiguous / map_query_failed`）。
+
+`segments` 是规定路段数组，每项包含 `id`、`lane_id`、`start_s_m`、`end_s_m`、`center_line`（世界 XY 米）。标准安装按当前实际 SDK 车道和有限线段投影得到进度；同一车道重复出现在多段时保持未知，需要队长通过 `task_inputs_provider` 提供已核实的当前任务段，不能按最近点猜测折返段。真实目的地另外提供 `destination_goal`（`x/y/body_heading_rad`）、完整 `destination_region` 和可选 `required_obligations`。局部参考末端不会完成任务。
+
+可选 `stop_rule` 为 `id / minimum_duration_s / strict`：ID 必须匹配当前实际信号停线观测键（单灯 `signal:<id>`，分组 `signals:<排序编号>`）。规则明确要求停留时，即使初始就是绿灯也要完成。`strict=true` 请求增加 0.001 秒以表达严格大于；车辆必须真实到位、连续静止。未完成规则不可更换；完成后可以进入新的不同 ID 规则。同一 ID 不因重复帧或暂时失联重启。沿用原信号义务命名规则，例如观测键 `signal:42` 对应控制义务 `signal:signal:42`。
+
+自动泊车可将 `parking.mission` 中的 `space_id/access_edge_index/body_heading_rad/approach_pose/position_pose` 替换为 `candidate_spaces` 数组。每项明确给出 `space_id/access_edge_index/body_heading_rad`；原 `task_verified/source/mission_id/road_lane_ids/exit_goal` 仍必需。选择器只选择当前正式地图/Sensor 证明空闲且容纳整车的候选，冻结后轴目标和实际道路中的接近点，并交原 P04 搜索。未知车位、入口、覆盖、地图或预算不足保持保护；候选配置不是实际空位证据。
+
+完整行为和数据责任见 [决策集成说明](../members/decision/PR23_MAIN_INTEGRATION.md)。这些扩展不改变共享发送开关，也不把模板当作现场确认。

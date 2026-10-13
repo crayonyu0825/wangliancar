@@ -88,7 +88,7 @@ class ParkingRuntime(object):
                     'PARKING_TASK_MISSION_UNVERIFIED')
             if (self.policy is not None and self.policy.session.status=='COMPLETED'
                     and self.mission_id==value.mission.mission_id):
-                self.claimed=False; self.reason='PARKING_TASK_ALREADY_COMPLETED'; return False
+                self.claimed=True; self.reason='PARKING_TASK_ALREADY_COMPLETED'; return True
             binding=value.binding()
             if self.policy is not None and self.policy.session.status in ('COMPLETED','CANCELLED'):
                 require(value.mission.mission_id!=self.mission_id,'PARKING_TASK_RESTART_REQUIRES_NEW_ID')

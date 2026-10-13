@@ -30,22 +30,24 @@ def _link_frame(perception, output):
 
 class DecisionEngine(object):
     def __init__(self, settings=None, clock=None,parking_inputs_provider=None,lane_change_inputs_provider=None,
-                 driving_inputs_provider=None):
+                 driving_inputs_provider=None, task_inputs_provider=None):
         self._clock = clock or time.monotonic
         self._parking_inputs_provider=parking_inputs_provider
         self._lane_change_inputs_provider=lane_change_inputs_provider
         self._driving_inputs_provider=driving_inputs_provider
+        self._task_inputs_provider=task_inputs_provider
         self.settings = (settings if settings is not None
                          else DecisionSettings.from_environment()).validate()
         self.reset()
 
     def reset(self):
-        self._history = TargetHistory(self.settings)
+        self._history = TargetHistory(self.settings, self._clock)
         if hasattr(self, "_behavior"):
             self._behavior.reset()
         else:
             self._behavior = BehaviorCoordinator(self.settings, self._clock,self._parking_inputs_provider,
-                                                 self._lane_change_inputs_provider,self._driving_inputs_provider)
+                                                 self._lane_change_inputs_provider,self._driving_inputs_provider,
+                                                 self._task_inputs_provider)
         self._last_constraints = None
         self._blind_fault_count = 0
         self._blind_stop = False
@@ -64,9 +66,15 @@ class DecisionEngine(object):
         self._last_frame = None
 
     def _observe_frame(self, perception):
+        formal = self._behavior._runtime_context
+        try:
+            from core.behavior_channel import read_channel
+            current, unused, unused = read_channel(perception, self._clock())
+        except (ValueError, TypeError, AttributeError, KeyError):
+            current = formal
         context = (getattr(perception, "case_id", ""),
                    getattr(perception, "task_id", ""),
-                   getattr(perception, "scene_id", 0))
+                   getattr(perception, "scene_id", 0), current.session_id if current is not None else '')
         frame = (getattr(perception, "frame_id", -1),
                  getattr(perception, "timestamp", 0))
         frame_id = frame[0]
@@ -78,8 +86,11 @@ class DecisionEngine(object):
         if self._context is None:
             self._context = context
         if (context != self._context or rolled_back) and trusted and not self._behavior.execution_pending():
-            self.reset()
-            self._context = context
+            old = self._behavior._runtime_context
+            new_session = old is not None and current is not None and current.session_id != old.session_id
+            if old is None or new_session:
+                self.reset()
+                self._context = context
         distinct = self._last_frame is None or frame_id != self._last_frame[0]
         if trusted:
             self._last_frame = frame
@@ -100,8 +111,17 @@ class DecisionEngine(object):
                 try:
                     self._behavior.observe_legacy(perception, output, self._last_constraints, self._clock())
                     self._behavior.apply_driving(perception,output)
+                    emergency_already_handled = output.mode == DecisionMode.EMERGENCY_BRAKE
                     self._behavior.apply_lane_change(perception,output,self._last_constraints)
                     self._behavior.apply_parking(perception,output)
+                    # Parking may discover a current body/target obstruction
+                    # after its provisional reverse-safe dispatch. Give the
+                    # existing emergency decision the same first-cycle brake.
+                    if (not emergency_already_handled and output.mode == DecisionMode.EMERGENCY_BRAKE
+                            and output.behavior_request is None):
+                        self._behavior.apply_driving(perception, output)
+                    self._behavior.apply_blocked(perception,output)
+                    self._behavior.apply_task(perception,output)
                 except (ValueError, TypeError, AttributeError, KeyError) as exc:
                     self._behavior.diagnostic_error(output.frame_id, type(exc).__name__)
                     if self._behavior.execution_pending() or self._behavior.parking.claimed:
@@ -343,7 +363,9 @@ class DecisionEngine(object):
                 self._static_targets.clear()
                 self._moving_confirm.clear()
                 self._target_hazard_ids.clear()
-        for kind, identifier, demand, reason in self._history.retained_constraints(ego_speed, cruising):
+        memories = (self._history.retained_constraints(ego_speed, cruising)
+                    + self._history.missing_danger_constraints(perception))
+        for kind, identifier, demand, reason in memories:
             result.add(kind, "target_history", identifier,
                        "{0}:id={1}".format(reason, identifier), speed=demand,
                        valid_until=perception.valid_until)

@@ -18,6 +18,8 @@ class DrivingRuntime(object):
         self.passage=session_factory()
         self.emergency=EmergencyPolicy(session=session_factory())
         self._latest={}; self._mission=None; self._completed=set()
+        self._passage_allowed = None
+        self._passage_epoch = 0
 
     def pending(self):
         return any(s.intent_id and s.status not in ('COMPLETED','CANCELLED')
@@ -127,7 +129,34 @@ class DrivingRuntime(object):
             # Current exit occupancy remains a separate admission veto. Every
             # predicted target, including pedestrians, is also checked by P05.
             allowed=allowed and scene['junction'].get('exit_occupancy')=='clear'
+            cells = [cell for polygon in scene['conflict_polygons'] for cell in convex_cells(polygon)]
+            age = now-facts.env.dynamic_observed_at_s
+            for obj in objects:
+                radius = .5*math.hypot(obj['length'], obj['width'])
+                heading = obj['heading']
+                body = rectangle(obj['x']+obj['vx']*age, obj['y']+obj['vy']*age,
+                    heading if heading is not None else 0.,
+                    obj['length']/2 if heading is not None else radius,
+                    obj['length']/2 if heading is not None else radius,
+                    obj['width']/2 if heading is not None else radius)
+                if any(intersects(body, cell) for cell in cells):
+                    allowed = False
+                    break
+            facts.check_current(True)
+            recovered = self._passage_allowed is False and allowed
+            self._passage_allowed = allowed
+            if recovered and self.passage.status == 'BLOCKED':
+                self._passage_epoch += 1
+                self.passage.renew_after_verified_change(frame,
+                    'passage-covered-occupied-to-clear:' + str(self._passage_epoch))
             inside=scene['already_inside']
+            if inside and not allowed:
+                if self.passage.intent_id is not None:
+                    self.passage.tick(frame, caps, safety_override=True)
+                output.mode, output.target_speed, output.stop_distance = 'EMERGENCY_BRAKE', 0., 0.
+                output.behavior_request = output.behavior_active_identity = None
+                self._latest = dict(phase='INSIDE_PROTECTION', reason_code='PASSAGE_PERMISSION_OR_SPACE_WITHDRAWN')
+                return
             stage='EXIT' if inside or self.passage.stage=='EXIT' else 'ENTER' if allowed else 'WAIT_ENTRY'
             front=inputs.vehicle_extents[0]
             stop=max(0.,scene['junction'].get('entry_distance_m',0.)-front-mission.entry_margin_m)

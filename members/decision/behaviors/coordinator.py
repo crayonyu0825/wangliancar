@@ -12,6 +12,7 @@ from members.decision.behaviors.environment import lane_candidates
 from members.decision.behaviors.parking_runtime import ParkingRuntime
 from members.decision.behaviors.lane_change_runtime import LaneChangeRuntime
 from members.decision.behaviors.driving_runtime import DrivingRuntime
+from members.decision.behaviors.task_runtime import TaskRuntime
 from members.decision.behaviors.stop_policies import (
     SignalDwellPolicy, SignalStopObservation, BlockedRoadPolicy, BlockingObservation,
 )
@@ -19,11 +20,12 @@ from members.decision.behaviors.stop_policies import (
 
 class BehaviorCoordinator(object):
     def __init__(self, settings, clock=None,parking_inputs_provider=None,lane_change_inputs_provider=None,
-                 driving_inputs_provider=None):
+                 driving_inputs_provider=None, task_inputs_provider=None):
         self.settings, self.clock = settings, clock or time.monotonic
         self.parking_inputs_provider=parking_inputs_provider
         self.lane_change_inputs_provider=lane_change_inputs_provider
         self.driving_inputs_provider=driving_inputs_provider
+        self.task_inputs_provider=task_inputs_provider
         self._generation = 0
         self.reset()
 
@@ -40,9 +42,12 @@ class BehaviorCoordinator(object):
         self.parking=ParkingRuntime(self.parking_inputs_provider,self._session,self.clock)
         self.lane_changes=LaneChangeRuntime(self.lane_change_inputs_provider,self._session,self.clock,self.settings)
         self.driving=DrivingRuntime(self.driving_inputs_provider,self._session,self.clock,self.settings)
+        self.task=TaskRuntime(self.task_inputs_provider,self._session,self.clock)
         self._signal_seen = set()
         self._runtime_context = None
         self._blockage_anchor = None
+        self._blockage_result = None
+        self._formal_signal_rule = None
         self._latest = dict(interface_status="proposal_not_runtime_connected", requests=[],
                             dependencies=["R05_EXECUTION_FEEDBACK", "R07_BEHAVIOR_GOAL_CHANNEL"],
                             frame_id=-1)
@@ -67,10 +72,14 @@ class BehaviorCoordinator(object):
                                traffic.signal_state != "GREEN", True))
         if not candidates or self.settings.front_offset_m is None:
             return None
+        if self._formal_signal_rule is not None:
+            candidates = [v for v in candidates if v[1] == self._formal_signal_rule[0]]
+            if not candidates:
+                return None
         distance, key, red, known = min(candidates)
         if red and known:
             self._signal_seen.add(key)
-        if key not in self._signal_seen:
+        if key not in self._signal_seen and self._formal_signal_rule is None:
             return None
         stop = max(0.0, distance - self.settings.front_offset_m - self.settings.traffic_stop_margin)
         if stop<1e-6:
@@ -95,6 +104,35 @@ class BehaviorCoordinator(object):
         frame = BehaviorFrame(context, perception.frame_id, now_s, perception.valid_until,
                               perception.ego.x, perception.ego.y, perception.ego.heading,
                               perception.ego.speed, usable=True)
+        if connected and self.task.provider is not None:
+            try:
+                task = self.task.current_inputs(perception, context, now_s)
+                rule = task.stop_rule if task is not None else None
+                if rule is None:
+                    if self._formal_signal_rule is not None and self.signal_pending():
+                        raise ValueError('UNFINISHED_TASK_STOP_RULE_WITHDRAWN')
+                else:
+                    signature = (rule['id'], rule['minimum_duration_s'], rule['strict'])
+                    if self._formal_signal_rule is None:
+                        if self.signal_pending():
+                            raise ValueError('ACTIVE_STOP_RULE_CHANGED')
+                        duration = rule['minimum_duration_s'] + (.001 if rule['strict'] else 0.)
+                        self.signal = SignalDwellPolicy(duration, self._session(), explicit_rule=True)
+                        self._formal_signal_rule = signature
+                    elif signature != self._formal_signal_rule:
+                        if self.signal_pending() or signature[0] == self._formal_signal_rule[0]:
+                            raise ValueError('ACTIVE_STOP_RULE_CHANGED')
+                        completed = set(self.signal._completed)
+                        duration = rule['minimum_duration_s'] + (.001 if rule['strict'] else 0.)
+                        self.signal = SignalDwellPolicy(duration, self._session(), explicit_rule=True)
+                        self.signal._context = context.key()
+                        self.signal._completed = completed
+                        self._formal_signal_rule = signature
+            except (ValueError, TypeError, AttributeError, KeyError) as error:
+                output.mode = 'EMERGENCY_BRAKE' if perception.ego.speed > self.settings.standstill_speed else 'STOP'
+                output.target_speed, output.stop_distance = 0., 0.
+                output.behavior_request = output.behavior_active_identity = None
+                output.reason = 'TASK_RULE_SOURCE:' + str(error)
         requests, policy_states = [], []
         environment = dict(usable=False, lane_candidates=[], reason='MANEUVER_ENVIRONMENT_UNAVAILABLE')
         try:
@@ -106,7 +144,7 @@ class BehaviorCoordinator(object):
         # collision/stop determination are still the existing shared facts.
         signal = self.signal.evaluate(frame, self._signal_observation(perception, output),
                                       capabilities=capabilities,feedback=reply(self.signal.session),
-                                      dwell_required=perception.scene_id == 20,
+                                      dwell_required=self._formal_signal_rule is not None or perception.scene_id == 20,
                                       safety_override=output.mode == "EMERGENCY_BRAKE")
         policy_states.append(dict(policy="SIGNAL_DWELL", phase=signal.phase, reason_code=signal.reason))
         if signal.request is not None:
@@ -126,7 +164,7 @@ class BehaviorCoordinator(object):
             output.behavior_request,output.behavior_active_identity = None,None
             output.reason = "SIGNAL_OBLIGATION_PENDING:"+signal.reason
         obstruction = None
-        if perception.scene_id == 11 and constraints is not None and constraints.blockage_candidates:
+        if constraints is not None and constraints.blockage_candidates:
             identifier, distance = min(constraints.blockage_candidates, key=lambda item: (item[1], item[0]))
             obstruction = BlockingObservation("target:" + str(identifier), distance, True,
                                                speed_cap_mps=output.target_speed)
@@ -154,6 +192,7 @@ class BehaviorCoordinator(object):
         blockage = self.blocked.evaluate(frame, obstruction,
                                          capabilities=capabilities,feedback=reply(self.blocked.session),
                                          safety_override=output.mode == "EMERGENCY_BRAKE")
+        self._blockage_result = blockage
         policy_states.append(dict(policy="BLOCKED_ROAD", phase=blockage.phase, reason_code=blockage.reason))
         if blockage.request is not None:
             requests.append(blockage.request.to_dict())
@@ -191,6 +230,40 @@ class BehaviorCoordinator(object):
         self.lane_changes.apply(perception,output,constraints,priority)
         if self.lane_changes.provider is not None:
             self._latest['lane_change']=self.lane_changes.snapshot()
+
+    def apply_blocked(self, perception, output):
+        """Warn only for unresolved static blockage after maneuver arbitration."""
+        result = self._blockage_result
+        if (result is None or result.request is None or output.behavior_request is not None
+                or self.signal_pending() or self.parking.claimed or self.parking.pending()
+                or self.lane_changes.pending() or self.driving.pending()
+                or signal_stop_requirement(perception) is not None or output.mode == 'EMERGENCY_BRAKE'):
+            return
+        request = result.request
+        if not request.dispatch_allowed or request.status in ('COMPLETED', 'CANCELLED'):
+            return
+        # A nearer stop obligation retains its own boundary and feedback.
+        if output.stop_distance >= 0 and output.stop_distance + 1e-6 < request.goal.stop_distance_m:
+            return
+        output.behavior_request = request.to_dict('runtime_connected')
+        output.behavior_active_identity = {k: output.behavior_request[k] for k in
+            ('intent_id', 'stage', 'revision', 'source_frame_id', 'issued_at_s')}
+        output.stop_distance = request.goal.stop_distance_m
+        output.precision_stop = True
+
+    def apply_task(self, perception, output):
+        parking_claim = self.parking.claimed and self.parking.reason != 'PARKING_TASK_ALREADY_COMPLETED'
+        temporary = (self.signal_pending() or parking_claim or self.parking.pending()
+                     or self.lane_changes.pending() or self.driving.pending()
+                     or output.behavior_request is not None)
+        completed = list(self.signal._completed)
+        completed.extend('signal:' + key for key in self.signal._completed)
+        if (self.parking.policy is not None and self.parking.policy.space is not None
+                and self.parking.policy.session.status == 'COMPLETED'):
+            completed.append('parking:' + str(self.parking.policy.space.identifier))
+        self.task.apply(perception, output, temporary, completed)
+        if self.task.provider is not None:
+            self._latest['task'] = self.task.snapshot()
 
     def diagnostic_error(self, frame_id, reason):
         self._latest = dict(interface_status="proposal_not_runtime_connected", frame_id=frame_id,

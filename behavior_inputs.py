@@ -16,6 +16,8 @@ from core.behavior_contract import finite,require,GoalPose
 from core.behavior_evidence import Evidence
 from core.driving_mission import DrivingMission,DrivingDecisionInputs
 from core.parking_mission import ParkingMission
+from core.task_route import TaskRouteFacts, TaskDecisionInputs
+from core.geometry import project_polyline, projection_within_polyline
 from core.maneuver_facts import ManeuverFacts
 from lane_change_integration import LaneChangeIntegrationInputs,LANE_CHANGE_CAPABILITIES
 from members.decision.behaviors.lane_change_runtime import LaneChangeDecisionInputs
@@ -28,6 +30,7 @@ from members.planning.driving_behavior import DrivingPlanningInputs
 from driving_integration import DrivingIntegrationInputs,DRIVING_ACTIONS
 from parking_integration import ParkingIntegrationInputs,PARKING_ACTIONS
 from members.decision.behaviors.parking_runtime import ParkingDecisionInputs
+from members.decision.behaviors.parking_selection import ParkingMissionSelector
 from members.planning.parking_behavior import ParkingPlanningInputs
 from members.planning.parking_generator import ParkingSearch
 from members.planning.parking_lattice import ParkingLatticeSearch,validate_lattice_search
@@ -57,6 +60,7 @@ class ConfiguredBehaviorInputs(object):
         self.lane_change_provider=None; self.lane_change_actions=()
         self.driving_provider=None; self.driving_actions=()
         self.parking_provider=None; self.parking_actions=()
+        self.task_provider=None
         self.vehicle_geometry=None
         self.status='NOT_CONFIGURED'; self.reference=''
         if document is None:
@@ -151,6 +155,28 @@ class ConfiguredBehaviorInputs(object):
                     'BEHAVIOR_CONFIG_DRIVING_AUTHORITY_UNVERIFIED')
         self.driving_provider=self._driving
         self.driving_actions=DRIVING_ACTIONS
+        route = document.get('task_route', {})
+        require(isinstance(route, dict) and type(route.get('enabled', False)) is bool,
+                'TASK_ROUTE_CONFIG_INVALID')
+        if route.get('enabled'):
+            require(route.get('verified') is True and _text(route.get('verification_reference'))
+                    and _text(route.get('route_id')) and route.get('reference_end_reason') in
+                    ('task_destination', 'window_end', 'map_end', 'branch_ambiguous', 'map_query_failed')
+                    and finite(route.get('speed_cap_mps')) and 0 < route['speed_cap_mps'] <= self.limits.max_speed_mps,
+                    'TASK_ROUTE_AUTHORITY_UNCONFIRMED')
+            segments = route.get('segments')
+            require(isinstance(segments, list) and 1 <= len(segments) <= 128,
+                    'TASK_ROUTE_SEGMENTS_INVALID')
+            for segment in segments:
+                require(isinstance(segment, dict) and set(segment) ==
+                        {'id', 'lane_id', 'start_s_m', 'end_s_m', 'center_line'}
+                        and _text(segment['id']) and _text(segment['lane_id'])
+                        and all(finite(segment[k]) for k in ('start_s_m', 'end_s_m'))
+                        and 0 <= segment['start_s_m'] < segment['end_s_m']
+                        and isinstance(segment['center_line'], list) and 2 <= len(segment['center_line']) <= 20000
+                        and all(isinstance(v, (tuple, list)) and len(v) == 2 and all(finite(x) for x in v)
+                                for v in segment['center_line']), 'TASK_ROUTE_SEGMENT_GEOMETRY_INVALID')
+            self.task_provider = self._task_route
         self._configure_parking(document.get('parking',{'enabled':False}))
         task=document.get('overtake')
         require(isinstance(task,dict) and type(task.get('enabled')) is bool,'BEHAVIOR_CONFIG_OVERTAKE_TASK_REQUIRED')
@@ -185,19 +211,31 @@ class ConfiguredBehaviorInputs(object):
         require(task.get('verified') is True and _text(task.get('verification_reference')),
                 'BEHAVIOR_CONFIG_PARKING_AUTHORITY_UNVERIFIED')
         mission=task.get('mission')
+        candidates = mission.get('candidate_spaces') if isinstance(mission, dict) else None
+        automatic = candidates is not None
         require(isinstance(mission,dict) and mission.get('task_verified') is True
                 and all(_text(mission.get(k)) for k in ('mission_id','source'))
-                and type(mission.get('space_id')) is int and mission['space_id']>=0
+                and (automatic or type(mission.get('space_id')) is int and mission['space_id']>=0)
                 and isinstance(mission.get('road_lane_ids'),list) and 1<=len(mission['road_lane_ids'])<=3
                 and all(_text(v) for v in mission['road_lane_ids'])
                 and len(set(mission['road_lane_ids']))==len(mission['road_lane_ids'])
-                and type(mission.get('access_edge_index')) is int and 0<=mission['access_edge_index']<=3
-                and finite(mission.get('body_heading_rad')),
+                and (automatic or type(mission.get('access_edge_index')) is int and 0<=mission['access_edge_index']<=3
+                and finite(mission.get('body_heading_rad'))),
                 'BEHAVIOR_CONFIG_PARKING_MISSION_UNVERIFIED')
-        for key in ('approach_pose','position_pose','exit_goal'):
+        for key in (('exit_goal',) if automatic else ('approach_pose','position_pose','exit_goal')):
             pose=mission.get(key)
             require(isinstance(pose,dict) and set(pose)=={'x','y','body_heading_rad'}
                     and all(finite(v) for v in pose.values()),'BEHAVIOR_CONFIG_PARKING_POSE_REQUIRED')
+        self.parking_selector = None
+        if automatic:
+            require(isinstance(candidates, list) and 1 <= len(candidates) <= 64
+                    and len({v.get('space_id') for v in candidates if isinstance(v, dict)}) == len(candidates)
+                    and all(isinstance(v, dict) and set(v) == {'space_id', 'access_edge_index', 'body_heading_rad'}
+                        and type(v['space_id']) is int and v['space_id'] >= 0
+                        and type(v['access_edge_index']) is int and 0 <= v['access_edge_index'] <= 3
+                        and finite(v['body_heading_rad']) for v in candidates), 'PARKING_CANDIDATES_INVALID')
+            self.parking_selector = ParkingMissionSelector(mission['mission_id'], mission['road_lane_ids'],
+                candidates, GoalPose(**mission['exit_goal']), self.clock, task.get('geometry_max_checks', 100000))
         tolerances=task.get('tolerances')
         require(isinstance(tolerances,list) and len(tolerances)==3
                 and all(finite(v) and v>0 for v in tolerances)
@@ -324,6 +362,29 @@ class ConfiguredBehaviorInputs(object):
             dynamic_search=base.dynamic_search,speed_error_mps=base.speed_error_mps,mission=mission)
         return DrivingIntegrationInputs(d,model,self.budget('monitor_budget',base.valid_until_s,self.clock()))
 
+    def _task_route(self, p, context):
+        base = self.model_snapshot(p, context)
+        spec = self.document['task_route']
+        selected = [v for v in spec['segments'] if v['lane_id'] == p.lane.lane_id]
+        require(len(selected) == 1, 'TASK_SEGMENT_SELECTION_UNAVAILABLE')
+        segment = selected[0]
+        projection = project_polyline(segment['center_line'], p.ego.x, p.ego.y)
+        require(projection_within_polyline(projection, len(segment['center_line']))
+                and p.lane.lane_width_valid and projection['distance'] < p.lane.lane_width / 2,
+                'TASK_PROGRESS_OUTSIDE_SELECTED_GEOMETRY')
+        proof = Evidence(context, p.frame_id, base.produced_at_s, base.valid_until_s, True, True,
+                         self.model_source + ':selected-task-route', source_kind='task')
+        raw_goal = spec.get('destination_goal')
+        goal = GoalPose(**raw_goal) if raw_goal is not None else None
+        facts = TaskRouteFacts(proof, spec['route_id'],
+            [(v['id'], v['lane_id'], v['start_s_m'], v['end_s_m']) for v in spec['segments']],
+            segment['id'], segment['start_s_m'] + projection['s'], spec['reference_end_reason'],
+            spec.get('destination_region'), goal, spec['speed_cap_mps'], True,
+            spec.get('required_obligations', ()))
+        return TaskDecisionInputs(facts, (self.vehicle_geometry.front_offset_m,
+            self.vehicle_geometry.rear_offset_m, self.vehicle_geometry.half_width_m),
+            self.document['scope']['map_digest'], spec.get('stop_rule'))
+
     def _parking(self,p,context):
         scope=self.document['scope']
         base=self.model_snapshot(p,context)
@@ -332,9 +393,12 @@ class ConfiguredBehaviorInputs(object):
                           self.parking_task_source+':'+spec['source'],source_kind='task')
         model_evidence=Evidence(context,p.frame_id,base.produced_at_s,base.valid_until_s,True,True,
                                 self.model_source,source_kind='task')
-        mission=ParkingMission(evidence,spec['mission_id'],scope['map_digest'],spec['space_id'],
-            spec['road_lane_ids'],spec['access_edge_index'],spec['body_heading_rad'],
-            *(GoalPose(**spec[k]) for k in ('approach_pose','position_pose','exit_goal')))
+        if self.parking_selector is not None:
+            mission = self.parking_selector.select(p, evidence, base, scope['map_digest'])
+        else:
+            mission=ParkingMission(evidence,spec['mission_id'],scope['map_digest'],spec['space_id'],
+                spec['road_lane_ids'],spec['access_edge_index'],spec['body_heading_rad'],
+                *(GoalPose(**spec[k]) for k in ('approach_pose','position_pose','exit_goal')))
         d=ParkingDecisionInputs(model_evidence,mission,base.model_id,tuple(getattr(base.vehicle,k) for k in
             ('front_offset_m','rear_offset_m','half_width_m')),task['position_uncertainty_m'],
             task['velocity_uncertainty_mps'],task['geometry_max_checks'],self.parking_tolerances,

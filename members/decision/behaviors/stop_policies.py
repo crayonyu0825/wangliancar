@@ -29,10 +29,12 @@ class SignalStopObservation(object):
 
 
 class SignalDwellPolicy(object):
-    def __init__(self, minimum_duration_s=5.1, session=None):
-        require(finite(minimum_duration_s) and minimum_duration_s > 5.0,
+    def __init__(self, minimum_duration_s=5.1, session=None, explicit_rule=False):
+        require(type(explicit_rule) is bool and finite(minimum_duration_s)
+                and minimum_duration_s > (0.0 if explicit_rule else 5.0),
                 "signal policy requires strictly more than five seconds")
         self.minimum_duration_s = minimum_duration_s
+        self.maneuver = 'RULE_STOP' if explicit_rule else 'SIGNAL_STOP'
         self.session = session or BehaviorSession()
         self.reset()
 
@@ -52,10 +54,9 @@ class SignalDwellPolicy(object):
             self.reset()
             self._context = frame.context.key()
         if self._last_frame is not None and frame.frame_id < self._last_frame:
-            old = self.session.finish(frame, False, "GPS_FRAME_ROLLBACK") if self.session.intent_id else None
-            self.reset()
-            self._context, self._last_frame = frame.context.key(), frame.frame_id
-            return PolicyResult(old, True, "GPS_FRAME_ROLLBACK", "RECOVER")
+            self._last_frame = frame.frame_id
+            old = self.session.tick(frame, capabilities, safety_override=True) if self.session.intent_id else None
+            return PolicyResult(old, True, 'GPS_FRAME_ROLLBACK_REVALIDATE', 'RECOVER')
         self._last_frame = frame.frame_id
         if not dwell_required:
             if self.session.intent_id is not None and self.session.status not in ("COMPLETED", "CANCELLED"):
@@ -89,7 +90,7 @@ class SignalDwellPolicy(object):
                             stop_obligation_id="signal:" + observation.stop_id)
         # One combined stop+dwell segment keeps the controller's same-stop
         # dwell identity; arrival does not reissue a new timed obligation.
-        self.session.start(frame, "signal:" + observation.stop_id, "SIGNAL_STOP",
+        self.session.start(frame, "signal:" + observation.stop_id, self.maneuver,
                            "STOP_AND_DWELL", goal, ("PATH_STOP", "DWELL", "FEEDBACK"))
         request = self.session.tick(frame, capabilities, feedback, safety_override)
         reply = self.session.last_feedback
@@ -102,7 +103,7 @@ class SignalDwellPolicy(object):
             complete = (reply.status == "COMPLETED" and reply.goal_pose_arrived
                         and reply.actual_standstill_confirmed and reply.hold_completed
                         and reply.standstill_duration_s >= self.minimum_duration_s
-                        and reply.standstill_duration_s > 5.0)
+                        and (self.maneuver == 'RULE_STOP' or reply.standstill_duration_s > 5.0))
             if complete:
                 self._completed.add(observation.stop_id)
                 if len(self._completed) > 64:
@@ -159,10 +160,10 @@ class BlockedRoadPolicy(object):
             self.reset()
             self._context = frame.context.key()
         if self._last_frame is not None and frame.frame_id < self._last_frame:
-            old = self.session.finish(frame, False, "GPS_FRAME_ROLLBACK") if self.session.intent_id else None
-            self.reset()
-            self._context, self._last_frame = frame.context.key(), frame.frame_id
-            return PolicyResult(old, True, "GPS_FRAME_ROLLBACK", "RECOVER")
+            self._clear, self._clear_source = 0, None
+            self._last_frame = frame.frame_id
+            old = self.session.tick(frame, capabilities, safety_override=True) if self.session.intent_id else None
+            return PolicyResult(old, True, "GPS_FRAME_ROLLBACK_REVALIDATE", "RECOVER")
         distinct = self._last_frame is None or frame.frame_id > self._last_frame
         self._last_frame = frame.frame_id
         if observation is None or not isinstance(observation, BlockingObservation) or not observation.usable:

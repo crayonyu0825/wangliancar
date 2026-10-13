@@ -53,6 +53,18 @@ class BehaviorContractTests(unittest.TestCase):
         self.assertEqual(9.0, repeated.goal.stop_distance_m)
         json.dumps(repeated.to_dict(), allow_nan=False)
 
+    def test_independent_or_replaced_policies_cannot_alias_intent_or_feedback(self):
+        first, initial = self.start()
+        second, other = self.start()
+        self.assertNotEqual(initial.intent_id, other.intent_id)
+        f = frame(2, 0.1)
+        second.tick(f, capabilities(f), feedback(initial, f))
+        self.assertIsNone(second.last_feedback)
+        second.reset()
+        unused, restarted = self.start(second)
+        self.assertNotEqual(initial.intent_id, restarted.intent_id)
+        self.assertNotEqual(other.intent_id, restarted.intent_id)
+
     def test_semantic_target_or_direction_change_revises_request(self):
         session, initial = self.start()
         f = frame(2, 0.1)

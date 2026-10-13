@@ -63,8 +63,12 @@ def validate_output(value, expected, source):
                 and bool(value.points) and value.points[-1].speed==0)
             driving=identity['stage'] in ('WAIT_ENTRY','ENTER','EXIT','BRAKE_FALLBACK',
                 'EXECUTE_BRAKE','EXECUTE_LEFT','EXECUTE_RIGHT','EXECUTE_BRAKE_LEFT','EXECUTE_BRAKE_RIGHT')
-            if (value.hold_duration_s!=0 or (identity['stage'] not in ('EXECUTE','SETTLE') and not parking and not driving)
+            forward_stop = identity['stage'] in ('STOP_AND_WARN', 'FOLLOW_ROUTE')
+            stop_shape = (value.precision_stop and value.stop_required and value.stop_distance >= 0
+                          and value.motion_direction == 1 and bool(value.points) and value.points[-1].speed == 0)
+            if (value.hold_duration_s!=0 or (identity['stage'] not in ('EXECUTE','SETTLE') and not parking and not driving and not forward_stop)
                     or (parking and not parking_shape)
+                    or (forward_stop and not stop_shape)
                     or not isinstance(reply,dict) or reply.get('producer')!='planning'
                     or reply.get('status')!='PLANNED' or reply.get('usable') is not True
                     or any(reply.get(k)!=identity[k] for k in ('intent_id','stage','revision'))

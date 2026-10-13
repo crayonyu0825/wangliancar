@@ -17,6 +17,7 @@ from core.traffic_quality import signal_stop_requirement
 from members.decision import speed_policy
 from members.decision.behaviors.environment import lane_candidates
 from members.decision.behaviors.lane_change import LaneChangePolicy
+from members.decision.behaviors.observations import vehicle_footprint, corridor_contains
 
 
 class LaneChangeDecisionInputs(object):
@@ -243,6 +244,21 @@ class LaneChangeRuntime(object):
                 return
             facts=ManeuverFacts(p,self.clock)
             objects=facts.objects()
+            if was_active and self.phase == 'OUT' and value.maneuver == 'OVERTAKE':
+                lead = next((v for v in objects if v['id'] == self.lead_id), None)
+                free = min(value.speed_cap, speed_policy.desired_speed(p, self.settings))
+                needed = lead is not None and math.hypot(lead['vx'], lead['vy']) + value.advantage < free
+                if not needed and p.lane.lane_id == self.origin_lane:
+                    road = facts.road(self.origin_lane, require_coverage=False)
+                    body = vehicle_footprint(GoalPose(p.ego.x, p.ego.y, p.ego.heading), *value.extents)
+                    if corridor_contains(body, [v[:2] for v in road['left_boundary']],
+                                         [v[:2] for v in road['right_boundary']]):
+                        facts.check_current(True)
+                        self.policy.session.finish(frame, False, 'OPPORTUNITY_WITHDRAWN_BEFORE_CROSSING')
+                        self.phase, self.reason = 'IDLE', 'OPPORTUNITY_WITHDRAWN_BEFORE_CROSSING'
+                        self.binding = None
+                        self.slow_id, self.slow_elapsed = None, 0.
+                        return
             if self.phase in ('IDLE','COMPLETE'):
                 # A one-way task remains completed; a fresh task requires a
                 # captain reset/provider identity rather than another crossing.
