@@ -25,7 +25,8 @@ def compute_control(perception, trajectory):
             and math.hypot(ego.x-guard.anchor[0],ego.y-guard.anchor[1])<=_engine.settings.precision_arrival_tolerance_m
             and abs(normalize_angle(ego.heading-guard.anchor[2]))<=_engine.settings.precision_heading_tolerance_rad)
         if (not trajectory.stop_obligation_id and not guard.active
-                and (identity.get('stage') in ('APPROACH','POSITION','ALIGN','EXIT_PREPARE','EXIT')
+                and (identity.get('stage') in ('APPROACH','POSITION','ALIGN','EXIT_PREPARE','EXIT',
+                                               'STOP_AND_WARN', 'FOLLOW_ROUTE')
                      or identity.get('stage') in ('EXECUTE_BRAKE','EXECUTE_LEFT','EXECUTE_RIGHT',
                                                 'EXECUTE_BRAKE_LEFT','EXECUTE_BRAKE_RIGHT'))
                 and trajectory.precision_stop and trajectory.stop_required and trajectory.points):

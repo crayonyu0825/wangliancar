@@ -41,12 +41,17 @@ class TargetTrack(object):
 
 
 class TargetHistory(object):
-    def __init__(self, settings):
+    def __init__(self, settings, clock=None):
         self.settings = settings
+        self._clock = clock
         self.reset()
 
     def reset(self):
         self.tracks = OrderedDict()
+        self._danger_memory = OrderedDict()
+        self._danger_clear_counts = {}
+        self._danger_clear_source = {}
+        self._danger_overflow = False
         self._context, self._source, self._last_frame, self._last_time = None, None, None, None
         self._now, self._usable, self._record, self._seen = 0.0, False, False, set()
         self.events = deque(maxlen=128)
@@ -65,7 +70,10 @@ class TargetHistory(object):
                   else "GPS_ROLLBACK" if rolled else "CLOCK_ROLLBACK" if clock_back else "")
         self.reset_reason = reason
         if reason:
+            retained = (self._danger_memory, self._danger_overflow)
             self.reset()
+            if reason in ('SOURCE_CHANGED', 'GPS_ROLLBACK', 'CLOCK_ROLLBACK', 'CONTEXT_CHANGED'):
+                self._danger_memory, self._danger_overflow = retained
             self.reset_reason = reason
             self.events.append(dict(frame_id=perception.frame_id, reason=reason))
         gap = self._last_time is not None and distinct and now_s - self._last_time > self.settings.history_max_gap_s
@@ -94,6 +102,25 @@ class TargetHistory(object):
         if not self._record:
             return
         sample = TargetSample(perception.frame_id, self._now, candidate, self.settings)
+        if (getattr(perception, 'behavior_channel', None)
+                and getattr(getattr(perception, 'maneuver_environment', None), 'valid', False)):
+            if sample.dangerous:
+                from core.maneuver_facts import ManeuverFacts
+                try:
+                    digest = ManeuverFacts(perception, self._clock or (lambda: self._now)).map_digest()
+                except (ValueError, TypeError, AttributeError, KeyError):
+                    digest = None
+                if identifier in self._danger_memory or len(self._danger_memory) < self.settings.history_max_tracks:
+                    self._danger_memory[identifier] = (target.x, target.y, target.z,
+                        target.length, target.width, target.heading, digest)
+                else:
+                    self._danger_overflow = True
+                self._danger_clear_counts[identifier] = 0
+                self._danger_clear_source.pop(identifier, None)
+            else:
+                self._danger_memory.pop(identifier, None)
+                self._danger_clear_counts.pop(identifier, None)
+                self._danger_clear_source.pop(identifier, None)
         track = self.tracks.get(identifier)
         if track is None:
             track = TargetTrack(identifier, self.settings.history_samples)
@@ -165,10 +192,79 @@ class TargetHistory(object):
                 result.append(("FOLLOW", identifier, demand, "HANDOFF_PREVIOUS_LEAD_CAP"))
         return result
 
+    def missing_danger_constraints(self, perception):
+        """History expiry never proves that a vanished hazard is clear.
+
+        Use main's Sensor/map facts and the original complete footprint. Only
+        distinct original Sensor packets can discharge the retained duty.
+        """
+        if not self._danger_memory and not self._danger_overflow:
+            return []
+        from core.maneuver_facts import ManeuverFacts
+        from core.behavior_channel import read_channel
+        from core.region_geometry import rectangle, intersects
+        result = []
+        if self._danger_overflow:
+            result.append(('PROTECT', -1, None, 'DANGER_MEMORY_LIMIT_REQUIRES_TASK_RESET'))
+        for identifier, shape in list(self._danger_memory.items()):
+            if identifier in self._seen:
+                continue
+            clear = False
+            source = None
+            try:
+                read_channel(perception, self._now)
+                facts = ManeuverFacts(perception, self._clock or (lambda: self._now))
+                objects = facts.objects()
+                x, y, z, length, width, heading, digest = shape
+                if digest is None or facts.map_digest() != digest:
+                    raise ValueError('retained hazard map changed')
+                if not all(number(v) and v > 0 for v in (length, width)):
+                    raise ValueError('retained hazard dimensions unavailable')
+                if heading is None:
+                    length = width = math.hypot(length, width)
+                    heading = 0.
+                body = rectangle(x, y, heading, length / 2, length / 2, width / 2)
+                clear = facts.region_visible([(a, b, z) for a, b in body])
+                age = self._now - facts.env.dynamic_observed_at_s
+                margin = .5 * self.settings.history_braking_uncertainty_mps2 * age * age
+                for obj in objects:
+                    size = math.hypot(obj['length'], obj['width'])
+                    yaw = obj['heading']
+                    front = (obj['length'] if yaw is not None else size) / 2 + margin
+                    half_width = (obj['width'] if yaw is not None else size) / 2 + margin
+                    occupied = rectangle(obj['x'] + obj['vx'] * age, obj['y'] + obj['vy'] * age,
+                                         yaw if yaw is not None else 0., front, front, half_width)
+                    if intersects(body, occupied):
+                        clear = False
+                        break
+                facts.check_current(True)
+                source = (perception.target_source, perception.targets_frame_id,
+                          facts.env.dynamic_observed_at_s)
+            except (ValueError, TypeError, AttributeError, KeyError, OverflowError):
+                clear = False
+            prior = self._danger_clear_source.get(identifier)
+            distinct = (source is not None and (prior is None or
+                        source[0] == prior[0] and source[1] > prior[1] and source[2] > prior[2]))
+            if self._record:
+                if clear and distinct:
+                    self._danger_clear_counts[identifier] = self._danger_clear_counts.get(identifier, 0) + 1
+                    self._danger_clear_source[identifier] = source
+                elif not clear or source is not None and prior is not None and source != prior and not distinct:
+                    self._danger_clear_counts[identifier] = 0
+                    self._danger_clear_source.pop(identifier, None)
+            if clear and self._danger_clear_counts.get(identifier, 0) >= self.settings.release_frames:
+                self._danger_memory.pop(identifier, None)
+                self._danger_clear_counts.pop(identifier, None)
+                self._danger_clear_source.pop(identifier, None)
+            else:
+                result.append(('PROTECT', identifier, None, 'DANGER_CLEARANCE_COVERAGE_UNVERIFIED'))
+        return result
+
     def snapshot(self):
         return dict(time_basis="local_monotonic_arrival_s", source=self._source,
                     reset_reason=self.reset_reason,
-                    track_count=len(self.tracks), tracks=[dict(
+                    track_count=len(self.tracks), unresolved_danger_ids=list(self._danger_memory),
+                    danger_memory_overflow=self._danger_overflow, tracks=[dict(
                         target_id=identifier, quality=track.quality, relation=track.relation,
                         handoff_state=track.handoff_state, was_followed=track.was_followed,
                         sample_count=len(track.samples), last_frame_id=track.samples[-1].frame_id,

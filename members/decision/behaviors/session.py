@@ -1,5 +1,7 @@
 """Stable intent identity, bounded retries and feedback-driven stage lifecycle."""
 
+import uuid
+
 from members.decision.behaviors.contract import (
     BehaviorFrame, BehaviorGoal, BehaviorRequest, Capabilities, FeedbackValidator,
     LightIntent, finite, require,
@@ -18,6 +20,10 @@ class BehaviorSession(object):
         self.progress_timeout_s, self.retry_delay_s = progress_timeout_s, retry_delay_s
         self.max_retries, self.max_observation_gap_s = max_retries, max_observation_gap_s
         self._counter = 0
+        # Policies own separate sessions and may be replaced within one task.
+        # A per-session namespace prevents their local counters from aliasing
+        # another policy's intent or accepting its acknowledgements.
+        self._identity_namespace = uuid.uuid4().hex
         self.reset()
 
     def reset(self):
@@ -29,6 +35,7 @@ class BehaviorSession(object):
         self.status, self.reason_code = "IDLE", "NO_INTENT"
         self.attempt, self._elapsed, self._no_progress = 0, 0.0, 0.0
         self._total_retries = 0
+        self._renewal_keys = set()
         self._last_frame, self._last_time, self._progress = None, None, 0.0
         self._hold_progress = 0.0
         self._suspended, self._dispatched = False, False
@@ -85,7 +92,8 @@ class BehaviorSession(object):
         self.reset()
         self._counter += 1
         self.context, self.key, self.maneuver, self.stage = frame.context, key, maneuver, stage
-        self.intent_id = "decision:{0}:{1}".format(frame.context.token(), self._counter)
+        self.intent_id = "decision:{0}:{1}:{2}".format(
+            frame.context.token(), self._identity_namespace, self._counter)
         self.revision, self.source_frame_id = 1, frame.frame_id
         self._issued_at_s = frame.observed_at_s
         self.goal, self.required = goal, tuple(required)
@@ -173,6 +181,22 @@ class BehaviorSession(object):
         self._dispatched = False
         self._event(frame, reason)
 
+    def renew_after_verified_change(self, frame, evidence_key, limit=2):
+        """Permit bounded re-evaluation after a caller-verified fact change.
+
+        A new frame or another acknowledgement is not a changed fact. Keep the
+        original intent and obligations; never renew a terminal action.
+        """
+        if (self.status != 'BLOCKED' or not isinstance(evidence_key, str) or not evidence_key
+                or type(limit) is not int or limit <= 0 or evidence_key in self._renewal_keys
+                or len(self._renewal_keys) >= limit or not frame.current(frame.observed_at_s)
+                or frame.paused or self.context.key() != frame.context.key()):
+            return False
+        self._renewal_keys.add(evidence_key)
+        self._total_retries = 0
+        self._revise(frame, 'VERIFIED_FACT_CHANGED_REVALIDATE')
+        return True
+
     def tick(self, frame, capabilities=None, feedback=None, safety_override=False):
         if self.intent_id is None:
             return None
@@ -191,7 +215,11 @@ class BehaviorSession(object):
         if self.context.key() != frame.context.key():
             return self.finish(frame, False, "TASK_CONTEXT_CHANGED")
         if self._last_frame is not None and frame.frame_id < self._last_frame:
-            return self.finish(frame, False, "GPS_FRAME_ROLLBACK")
+            self._last_frame, self._last_time = frame.frame_id, frame.observed_at_s
+            self._suspended, self._dispatched = True, False
+            self.status, self.reason_code = 'SUSPENDED', 'GPS_FRAME_ROLLBACK_REVALIDATE'
+            self._event(frame, self.reason_code)
+            return self.snapshot(frame)
         distinct = self._last_frame is None or frame.frame_id > self._last_frame
         dt = 0.0 if self._last_time is None else frame.observed_at_s - self._last_time
         if dt < 0:
@@ -248,6 +276,10 @@ class BehaviorSession(object):
                 elif feedback.status == "FAILED":
                     return self.block(frame, feedback.reason_code or "EXECUTION_FAILED")
                 else:
+                    if (self.maneuver == 'BLOCKED_ROAD' and feedback.producer in ('control', 'runtime')
+                            and feedback.actual_standstill_confirmed
+                            and (feedback.goal_pose_arrived or 0 <= self.goal.stop_distance_m <= 1.0)):
+                        self._no_progress = 0.0
                     if feedback.progress > self._progress:
                         self._progress = feedback.progress
                         self._no_progress = 0.0

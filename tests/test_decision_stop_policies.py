@@ -129,7 +129,7 @@ class StopPolicyTests(unittest.TestCase):
         self.assertTrue(same.hold_required)
         self.assertFalse(same.request.dispatch_allowed)
 
-    def test_task_switch_and_frame_rollback_reset_completed_stop_ledger(self):
+    def test_same_session_rollback_keeps_completed_ledger_and_new_task_resets_it(self):
         policy = SignalDwellPolicy()
         f = frame(5, 0.0)
         r = policy.evaluate(f, signal(), caps(f)).request
@@ -142,7 +142,7 @@ class StopPolicyTests(unittest.TestCase):
         self.assertEqual("RECOVER", reset.phase)
         fresh = frame(2, 0.3)
         new = policy.evaluate(fresh, signal(False), caps(fresh))
-        self.assertNotEqual("COMPLETED", new.request.status)
+        self.assertEqual("COMPLETED", new.request.status)
         changed = frame(3, 0.4, context("new"))
         another = policy.evaluate(changed, signal(), caps(changed))
         self.assertNotEqual(new.request.intent_id, another.request.intent_id)
@@ -171,6 +171,22 @@ class StopPolicyTests(unittest.TestCase):
         self.assertEqual("COMPLETE", done.phase)
         self.assertFalse(done.request.goal.light_intent.hazard_signal)
         self.assertFalse(done.hold_required)
+
+    def test_blockage_frame_rollback_keeps_unfinished_intent_and_requires_revalidation(self):
+        policy = BlockedRoadPolicy()
+        f = frame(5, .5)
+        observation = BlockingObservation('b', 0., True)
+        first = policy.evaluate(f, observation, caps(f)).request
+        f = frame(1, .6)
+        rolled = policy.evaluate(f, None, caps(f))
+        self.assertEqual(first.intent_id, rolled.request.intent_id)
+        self.assertFalse(rolled.request.dispatch_allowed)
+        self.assertTrue(rolled.request.goal.light_intent.hazard_signal)
+        f = frame(2, .7)
+        restored = policy.evaluate(f, observation, caps(f)).request
+        self.assertEqual(first.intent_id, restored.intent_id)
+        self.assertGreater(restored.revision, first.revision)
+        self.assertTrue(restored.dispatch_allowed)
 
 
 if __name__ == "__main__":

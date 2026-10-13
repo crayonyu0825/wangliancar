@@ -84,10 +84,12 @@ def target_input_summary(perception):
 class CaptainRuntime(object):
     def __init__(self, config, logger,parking_inputs_provider=None,parking_actions=(),
                  lane_change_inputs_provider=None,lane_change_actions=(),
-                 driving_inputs_provider=None,driving_actions=()):
+                 driving_inputs_provider=None,driving_actions=(),task_inputs_provider=None):
         self.config = config
         self.logger = logger
         self.configured_behaviors=load_behavior_inputs(config)
+        if task_inputs_provider is None:
+            task_inputs_provider = self.configured_behaviors.task_provider
         if parking_inputs_provider is None and not parking_actions:
             parking_inputs_provider=self.configured_behaviors.parking_provider
             parking_actions=self.configured_behaviors.parking_actions
@@ -156,7 +158,8 @@ class CaptainRuntime(object):
         reset_decision(settings=decision_model_settings,
                        parking_inputs_provider=self.parking.decision_inputs if self.parking else None,
                        lane_change_inputs_provider=self.lane_changes.decision_inputs if self.lane_changes else None,
-                       driving_inputs_provider=self.driving.decision_inputs if self.driving else None)
+                       driving_inputs_provider=self.driving.decision_inputs if self.driving else None,
+                       task_inputs_provider=task_inputs_provider)
         _validate_motion_contract(planning_settings, decision_settings())
         self.safety = SafetySupervisor(config, planning_settings=planning_settings,
                                        decision_settings=decision_settings(),parking_guard=(
@@ -175,8 +178,12 @@ class CaptainRuntime(object):
                                   "behavior_model_status":self.configured_behaviors.status,
                                   "started_at": time.strftime("%Y-%m-%d %H:%M:%S")})
         configure_control(config)
-        actions=list(("PATH_STOP","DWELL","FEEDBACK")
+        actions=list(("PATH_STOP","DWELL","FEEDBACK", "LIGHTS")
                      if getattr(config,"control_calibrated",False) else ())
+        if task_inputs_provider is not None:
+            if getattr(config, 'control_calibrated', False) is not True:
+                raise ValueError('task progress requires configured control')
+            actions.extend(('TASK_ROUTE', 'PATH'))
         self.behaviors = BehaviorTransport(tuple(dict.fromkeys(
             actions+list(parking_actions)+list(lane_change_actions)+list(driving_actions))))
 

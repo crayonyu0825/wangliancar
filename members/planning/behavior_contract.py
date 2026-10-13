@@ -164,10 +164,24 @@ def _goal(request, current_lane_id, runtime_stop=False, runtime_lane_change=Fals
                  'LANE_CHANGE_STAGE_NOT_PLANNABLE')
         return
     _require(lane is None or lane == current_lane_id, "UNSUPPORTED_TARGET_LANE")
+    if runtime_stop and request['maneuver'] == 'CONTINUOUS_TASK':
+        _require(parking is None and request['stage'] == 'FOLLOW_ROUTE' and distance >= 0
+                 and dwell == 0 and obligation is None and request['precision_stop']
+                 and not request['parking_brake_at_stop'] and not any(lights.values()),
+                 'UNSUPPORTED_RUNTIME_TASK')
+        return
     _require(parking is None and pose is None, "UNSUPPORTED_POSE_OR_PARKING_TARGET")
     if runtime_stop:
-        _require(request["maneuver"]=="SIGNAL_STOP" and request["stage"]=="STOP_AND_DWELL"
-                 and obligation is not None and dwell>5 and request["precision_stop"]
+        blocked = request['maneuver'] == 'BLOCKED_ROAD'
+        if blocked:
+            _require(request['stage'] == 'STOP_AND_WARN' and obligation is None and dwell == 0
+                     and request['precision_stop'] and not request['parking_brake_at_stop']
+                     and lights['hazard_signal'] and not lights['left_signal'] and not lights['right_signal'],
+                     'UNSUPPORTED_RUNTIME_BLOCKAGE')
+            return
+        _require(request["maneuver"] in ("SIGNAL_STOP", "RULE_STOP") and request["stage"]=="STOP_AND_DWELL"
+                 and obligation is not None and dwell > (0 if request['maneuver'] == 'RULE_STOP' else 5)
+                 and request["precision_stop"]
                  and not request["parking_brake_at_stop"] and not any(lights.values()),
                  "UNSUPPORTED_RUNTIME_STOP")
     else:
@@ -251,7 +265,7 @@ def assess_behavior_request(request, context, frame_id, now_s, valid_until_s,
                  and request["attempt"] >= 0, "REQUEST_VALUES")
         enabled = _strings(supported_actions, "LOCAL_ACTIONS_INVALID")
         implemented = (DRIVING_ACTIONS if runtime_driving else ('PARK',) if runtime_parking else LANE_CHANGE_ACTIONS if runtime_lane_change
-                       else ("SIGNAL_STOP",) if runtime_stop else COMPONENT_ACTIONS)
+                       else ("SIGNAL_STOP", "RULE_STOP", "BLOCKED_ROAD", "CONTINUOUS_TASK") if runtime_stop else COMPONENT_ACTIONS)
         _require(enabled <= set(implemented), "LOCAL_ACTIONS_UNSUPPORTED")
         action = request["maneuver"]
         _require(action in implemented, "UNSUPPORTED_MANEUVER")
@@ -273,6 +287,8 @@ def assess_behavior_request(request, context, frame_id, now_s, valid_until_s,
                  ('PARK','PATH','FEEDBACK')+ (('REVERSE','DWELL') if request['stage'] in
                  ('REVERSE_ENTRY','ALIGN','PARKED_DWELL','EXIT_PREPARE') else ()) if runtime_parking else
                  ('LANE_CHANGE','PATH','LIGHTS','FEEDBACK') if runtime_lane_change else
+                 (required,'TASK_ROUTE','FEEDBACK') if runtime_stop and action=='CONTINUOUS_TASK' else
+                 (required,'LIGHTS','FEEDBACK') if runtime_stop and action=='BLOCKED_ROAD' else
                  (required,'DWELL','FEEDBACK') if runtime_stop else (required,))
         missing = sorted(set(needs) - actions)
         _require(not missing, "CAPABILITY_ACTIONS_MISSING", True, missing)

@@ -372,3 +372,11 @@ class ManeuverFacts(object):
                  and any(inside(anchor[:2], v['polygon']) for v in views))
         self._fresh(True)
         return clear
+
+    def region_visible(self, outline_xyz):
+        """Whole remembered footprint under this original Sensor packet."""
+        outline = _points(outline_xyz, 3, minimum=3, maximum=128)
+        views = self.coverage(outline)
+        covered = self._covered_region([p[:2] for p in outline], views)
+        self._fresh(True)
+        return covered

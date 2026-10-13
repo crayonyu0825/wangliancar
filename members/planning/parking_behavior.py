@@ -196,6 +196,7 @@ class ParkingBehaviorPlanner(object):
         # at most eight nominal endpoints still needs the complete P04 proof.
         checks=0
         if (previous is not None and previous['revision'][1]==request['stage'] and previous['accepted']
+                and previous['revision'][0] == request['revision']
                 and len(previous['reference'])>=3):
             retained=self._remaining(p,mission,model,request,cap,previous['reference'])
             checks=retained.get('checks',0)

@@ -23,7 +23,7 @@ class StopBehaviorPlanner(object):
             context,caps,unused = read_channel(p,now)
             assessment = assess_behavior_request(request,context.to_dict(),p.frame_id,now,
                 p.valid_until,"process_monotonic",decision.behavior_active_identity,
-                capabilities=capabilities_dict(caps),supported_actions=("SIGNAL_STOP",),
+                capabilities=capabilities_dict(caps),supported_actions=("SIGNAL_STOP", "RULE_STOP", "BLOCKED_ROAD", "CONTINUOUS_TASK"),
                 current_lane_id=p.lane.lane_id,frame_usable=p.valid,frame_paused=False,runtime_stop=True)
             if not assessment["eligible"]:
                 raise ValueError(assessment["reason_code"])
@@ -57,7 +57,8 @@ class StopBehaviorPlanner(object):
                 output.behavior_feedback = self._reply(context,request,p,now,"REJECTED","EARLIER_PLANNING_STOP")
                 return output
             output.hold_duration_s = request["minimum_standstill_duration_s"]
-            output.stop_obligation_id = request["stop_obligation_id"]
+            output.hazard_signal = request['light_intent']['hazard_signal']
+            output.stop_obligation_id = request["stop_obligation_id"] or ''
             output.behavior_identity = {key:request[key] for key in ("intent_id","stage","revision")}
             self.revisions[request["intent_id"]] = revision
             if len(self.revisions)>128:
