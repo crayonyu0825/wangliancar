@@ -102,11 +102,12 @@ class ManeuverEnvironmentBuilder(object):
         self.pose_history = SensorPoseHistory(self.vehicle_id,self.sensor_timeout_ms)
         self.visibility_max_checks=visibility_max_checks
 
-    def build(self, perception):
+    def build(self, perception, gps_pose_sample=None):
         env = ManeuverEnvironment().bind(perception)
         env.case_id,env.task_id,env.scene_id = perception.case_id,perception.task_id,perception.scene_id
         now = self.clock()
         self.pose_history.observe(perception,now)
+        self.pose_history.seed_callback(perception,gps_pose_sample,now)
         gps = perception.source_status.get("gps",{})
         gps_age = gps.get("age_ms",-1) if isinstance(gps,dict) else -1
         if (perception.valid is not True or not perception.ego.valid

@@ -54,6 +54,85 @@ class SensorPoseHistoryTests(unittest.TestCase):
         old_packet(p,1,50)
         return builder,p
 
+    def test_callback_supplies_exact_sensor_pose_missed_by_control_polling(self):
+        from simone_platform.gps_pose_stream import GpsPoseStream
+        p = headers(perception(),10,500,x=10.)
+        stream = GpsPoseStream('0',clock=self.clock)
+        stream.set_scope(p.case_id,p.task_id)
+        stream.set_installations(p.sensor_configurations,True)
+        native = NS(frame=10,timestamp=500,isGPSLost=False,posX=10.,posY=0.,posZ=p.ego.z,
+                    oriX=0.,oriY=0.,oriZ=0.)
+        stream.receive(b'0',NS(contents=native))
+        self.clock.now += .1
+        headers(p,16,800,x=60.)
+        old_packet(p,10,500)
+        builder = self.builder(p)
+        env = builder.build(p,stream.select(10,500))
+        self.assertTrue(env.coverage_regions,env.status)
+        region = env.coverage_regions[0]
+        self.assertEqual('sensor_pose_history_exact_callback_frame',region['pose_source'])
+        self.assertTrue(inside((10.,0.),region['polygon']))
+        self.assertFalse(inside((60.,0.),region['polygon']))
+        self.assertEqual(100.,env.dynamic_observed_at_s)
+        self.assertEqual(100.5,env.dynamic_valid_until)
+        self.clock.now = 100.5
+        self.assertIsNone(stream.select(10,500))
+
+    def test_wrong_task_conflicting_or_repeated_callback_cannot_refresh_pose(self):
+        from simone_platform.gps_pose_stream import GpsPoseStream
+        p = headers(perception(),10,500)
+        stream = GpsPoseStream('0',clock=self.clock)
+        stream.set_scope(p.case_id,p.task_id)
+        stream.set_installations(p.sensor_configurations,True)
+        native = NS(frame=10,timestamp=500,isGPSLost=False,posX=10.,posY=0.,posZ=p.ego.z,
+                    oriX=0.,oriY=0.,oriZ=0.)
+        stream.receive(b'0',NS(contents=native))
+        self.clock.now += .2
+        stream.receive(b'0',NS(contents=native))
+        self.assertEqual(100.,stream.select(10,500)['observed_at_s'])
+        native.posX = 11.
+        stream.receive(b'0',NS(contents=native))
+        self.assertIsNone(stream.select(10,500))
+        stream.set_scope(p.case_id,'other-task')
+        self.assertEqual(0,len(stream.samples))
+
+    def test_adapter_snapshot_delivers_callback_pose_to_real_perception_builder(self):
+        from perception.perception_builder import PerceptionBuilder
+        from simone_platform.simone_adapter import SimOneAdapter
+        from tests.test_perception import FakeRouteManager
+        p = headers(perception(),10,500)
+        self.builder(p)  # Explicit verified visibility fixture, not inferred coverage.
+        config = NS(vehicle_id='0',sensor_timeout_ms=500,sensor_visibility_file=self.path,
+                    pipeline_timeout_ms=200,max_sensor_frame_gap=10)
+        adapter = SimOneAdapter(config,NS())
+        adapter.gps_poses.clock = self.clock
+        adapter.gps_poses.set_scope(p.case_id,p.task_id)
+        adapter.gps_poses.set_installations(p.sensor_configurations,True)
+        gps = NS(frame=10,timestamp=500,isGPSLost=False,posX=10.,posY=0.,posZ=p.ego.z,
+                 oriX=0.,oriY=0.,oriZ=0.,velX=0.,velY=0.,velZ=0.,accelX=0.,accelY=0.,accelZ=0.,
+                 angVelZ=0.,wheelSpeedFL=0.,wheelSpeedFR=0.,wheelSpeedRL=0.,wheelSpeedRR=0.,
+                 odometer=0.,throttle=0.,brake=0.,steering=0.,gear=1)
+        adapter.gps_poses.receive(b'0',NS(contents=gps))
+        self.clock.now = 100.1
+        gps.frame,gps.timestamp,gps.posX = 16,800,60.
+        adapter.structs = NS(SimOne_Data_Gps=lambda:gps)
+        adapter.sensor_api = NS(SoGetGps=lambda *args:True)
+        adapter.read_traffic = lambda lane_id:[]
+        with patch('time.monotonic',self.clock), \
+                patch.object(adapter,'_read_reference_data',return_value=dict(
+                    sensor_configurations=p.sensor_configurations,sensor_configurations_valid=True)), \
+                patch.object(adapter,'_read_target_sources',return_value=([],p.target_source,10,500,{},[])), \
+                patch.object(adapter,'_read_auxiliary_data',return_value={}):
+            builder = PerceptionBuilder(adapter,FakeRouteManager(),scene_override=7)
+            builder.case_id,builder.task_id = p.case_id,p.task_id
+            actual = builder.build()
+        self.assertTrue(actual.maneuver_environment.coverage_regions,actual.maneuver_environment.status)
+        coverage = actual.maneuver_environment.coverage_regions[0]
+        self.assertEqual(10,coverage['pose_frame_id'])
+        self.assertEqual('sensor_pose_history_exact_callback_frame',coverage['pose_source'])
+        self.assertTrue(inside((10.,0.),coverage['polygon']))
+        self.assertFalse(inside((60.,0.),coverage['polygon']))
+
     def test_old_packet_uses_saved_pose_and_original_observation_deadline(self):
         builder,p=self.seed(); env=builder.build(p)
         self.assertTrue(env.coverage_regions)

@@ -264,6 +264,8 @@ class PipelineIntegrationTests(unittest.TestCase):
     def run_pipeline(self, **options):
         project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         config = load_config(project)
+        # This harness inspects every frame; production snapshots are throttled.
+        config.diagnostic_interval_s = 0.0
         config.scene_id_override = options.get("scene", 4)
         config.send_control = not options.get("observe", False)
         config.safety_brake_enabled = True
@@ -282,6 +284,7 @@ class PipelineIntegrationTests(unittest.TestCase):
                 publish = runtime._publish_pipeline
                 def capture(*args):
                     publish(*args)
+                    runtime.flush_diagnostics()
                     with open(runtime.pipeline_path, encoding="utf-8") as stream:
                         sdk.pipelines.append(json.load(stream))
                 with patch.object(runtime, "_sleep_remaining", return_value=None), \

@@ -4,6 +4,8 @@
 
 ## 配置方法
 
+已接入按实际任务读取安装包缓存和跟踪误差观测，结果位于 `latest_pipeline.json`；已知车辆/传感器参数及仍缺少的依据见[运行周期与输入说明](../RUNTIME_INPUT_READINESS.md)。这些记录不会自动将模型声明为已标定或启用业务。
+
 1. 将 [未确认模板](behavior_model.example.json) 复制到本机忽略目录，例如 `runtime_data/behavior_model.local.json`。模板的 `null` 表示未知；其中已有搜索参数只是数值尝试范围，不是车辆标定结果。
 2. 队长与负责成员核对下表中的来源，补齐模型及对应任务，再明确设置确认字段。`verified=true` 是提供者的确认声明，程序不会因此产生实测证据。旧字段 `control_calibrated=true` 也只表示控制映射已经配置。
 3. 在不提交的 `config/local.ini` 的 `[app]` 中添加：

@@ -7,6 +7,8 @@ import signal
 import time
 
 from core.serialization import perception_to_dict, to_dict
+from core.diagnostic_writer import DiagnosticWriter
+from core.tracking_measurements import TrackingMeasurements
 from core.validation import validate_output
 from core.interfaces import DecisionTarget, Trajectory, ControlOut
 from core.safety_supervisor import SafetySupervisor,SafetyAssessment
@@ -24,6 +26,7 @@ from perception.perception_builder import PerceptionBuilder
 from perception.route_manager import RouteManager, ROUTE_REFERENCE_VERSION
 from simone_platform.simone_adapter import SimOneAdapter
 from simone_platform.sensor_catalog import TARGET_INGESTION_VERSION
+from simone_platform.task_configuration import installed_task_parameters
 
 
 def _member_output(value, expected, source):
@@ -109,6 +112,14 @@ class CaptainRuntime(object):
         self.pipeline_path = os.path.join(config.runtime_dir, "latest_pipeline.json")
         self._warned_no_control = False
         self._snapshot_failures = set()
+        self._diagnostics = DiagnosticWriter(lambda path, data:self._publish_json(path,data))
+        self._diagnostic_next, self._diagnostic_event_next = 0.0, 0.0
+        self._diagnostic_cycle = None
+        self._loop_timing = {}
+        self._input_task, self._input_readiness = None, {}
+        self._input_retry_at = 0.
+        self._tracking_measurements = TrackingMeasurements()
+        self._timing_summary = dict(cycles=0,over_budget_cycles=0,max_ms={})
         self._braking_signature = None
         self._braking_next_sample = 0.0
         self._braking_event_count = 0
@@ -171,6 +182,7 @@ class CaptainRuntime(object):
                                        execution_guard=self._assess_execution)
         self.runtime_info = decision_info()
         self.runtime_info.update({"pid": os.getpid(),
+                                  "runtime_io_version": "bounded-diagnostics-exact-pose-v1",
                                   "project_dir": os.path.dirname(os.path.abspath(__file__)),
                                   "target_ingestion_version": TARGET_INGESTION_VERSION,
                                   "route_reference_version": ROUTE_REFERENCE_VERSION,
@@ -220,6 +232,8 @@ class CaptainRuntime(object):
                 info["cruise_speed"] * 3.6,
             )
             self.logger.info("路线接续实现 version=%s", ROUTE_REFERENCE_VERSION)
+            self.logger.info('运行诊断 version=%s interval=%.3fs GPS采用同帧回调历史',
+                             self.runtime_info['runtime_io_version'],self.config.diagnostic_interval_s)
             try:
                 self.adapter.bootstrap()
                 self.adapter.initialize()
@@ -236,6 +250,7 @@ class CaptainRuntime(object):
                 self._loop(builder, once)
             finally:
                 try:
+                    self._diagnostics.close()
                     self.adapter.shutdown()
                 finally:
                     self._remove_pid()
@@ -251,6 +266,7 @@ class CaptainRuntime(object):
             if self._consume_stop_request():
                 break
             start = time.time()
+            cycle_start = time.perf_counter()
             if processed == 0:
                 self.logger.info("首帧检查: 查询案例状态")
             status = self.adapter.get_case_status()
@@ -263,7 +279,9 @@ class CaptainRuntime(object):
                 continue
             if processed == 0:
                 self.logger.info("首帧检查: 案例运行中，开始读取感知")
+            phase_start = time.perf_counter()
             perception = builder.build()
+            timing = {'perception':(time.perf_counter()-phase_start)*1000.}
             lane = perception.lane
             route_signature = (lane.lane_id, tuple(lane.forward_lane_ids),
                                lane.forward_reference_valid, lane.forward_reference_status)
@@ -282,16 +300,21 @@ class CaptainRuntime(object):
             if self.parking: self.parking.prepare(perception)
             if self.lane_changes: self.lane_changes.prepare(perception)
             if self.driving: self.driving.prepare(perception)
+            phase_start = time.perf_counter()
             try:
                 decision = _member_output(decide(perception), DecisionTarget, perception)
             except Exception as exc:
                 decision = DecisionTarget().bind(perception)
                 decision.errors.append("DECISION_INVALID:" + type(exc).__name__ + ":" + str(exc))
+            timing['decision'] = (time.perf_counter()-phase_start)*1000.
+            phase_start = time.perf_counter()
             try:
                 trajectory = _member_output(plan(perception, decision), Trajectory, decision)
             except Exception as exc:
                 trajectory = Trajectory().bind(decision)
                 trajectory.errors.append("TRAJECTORY_INVALID:" + type(exc).__name__ + ":" + str(exc))
+            timing['planning'] = (time.perf_counter()-phase_start)*1000.
+            phase_start = time.perf_counter()
             try:
                 control = compute_control(perception, trajectory)
                 if control.valid:
@@ -299,7 +322,11 @@ class CaptainRuntime(object):
             except Exception as exc:
                 control = ControlOut().bind(trajectory)
                 control.errors.append("CONTROL_INVALID:" + type(exc).__name__ + ":" + str(exc))
+            timing['control'] = (time.perf_counter()-phase_start)*1000.
+            phase_start = time.perf_counter()
             safety = self.safety.evaluate(perception, decision, trajectory, control)
+            timing['safety'] = (time.perf_counter()-phase_start)*1000.
+            phase_start = time.perf_counter()
             receipt = {"attempted": False, "ok": False, "reason": "observe_mode",
                        "safety_mode": safety.mode, "safety_reason": safety.reason,
                        "safety_candidate": safety.control is not None}
@@ -336,19 +363,32 @@ class CaptainRuntime(object):
                 else:
                     receipt["reason"] = "pipeline_invalid"
             self.behaviors.observe(perception,decision,trajectory,control,safety.active,receipt)
+            timing['send_and_feedback'] = (time.perf_counter()-phase_start)*1000.
             for bridge in (self.parking,self.lane_changes,self.driving):
                 if bridge is not None:
                     bridge.record_sent(perception,trajectory,receipt,safety.active)
             if self.lane_changes:
                 self.lane_changes.observe_lights(perception,decision,trajectory,control,
                                                 self.behaviors,receipt,safety.active)
-            # Flush after sending control, so file I/O cannot expire its frame.
-            self._flush_evaluation()
             if self.config.publish_json:
+                self._tracking_measurements.record(perception,trajectory,receipt,safety.active,time.monotonic())
+            # Flush after sending control, so file I/O cannot expire its frame.
+            phase_start = time.perf_counter()
+            self._flush_evaluation()
+            timing['evaluation'] = (time.perf_counter()-phase_start)*1000.
+            phase_start = time.perf_counter()
+            timing['before_diagnostics'] = (phase_start-cycle_start)*1000.
+            timing['previous_cycle'] = self._loop_timing.get('total',0.)
+            timing['previous_diagnostic_enqueue'] = self._loop_timing.get('diagnostic_enqueue',0.)
+            self._loop_timing = timing
+            if self.config.publish_json and time.monotonic() >= self._diagnostic_next:
+                self._diagnostic_next = time.monotonic()+getattr(self.config,'diagnostic_interval_s',.5)
+                self._diagnostic_cycle = processed
                 self._publish(perception)
                 self._publish_pipeline(perception, decision, trajectory, control, receipt,
                                        safety)
             self._trace_braking(perception, decision, trajectory, control, receipt, safety)
+            timing['diagnostic_enqueue'] = (time.perf_counter()-phase_start)*1000.
             processed += 1
             if processed == 1 or processed % 100 == 0:
                 target_status = perception.source_status.get("targets", {})
@@ -374,9 +414,23 @@ class CaptainRuntime(object):
                     trajectory.stop_distance, control.brake,
                     control.diagnostics.get("reference_speed_mps"), safety.reason,
                 )
+            timing['total'] = (time.perf_counter()-cycle_start)*1000.
+            self._timing_summary['cycles'] += 1
+            self._timing_summary['over_budget_cycles'] += int(timing['total']>period*1000.)
+            for key,value in timing.items():
+                if not key.startswith('previous_'):
+                    maxima = self._timing_summary['max_ms']
+                    maxima[key] = max(maxima.get(key,0.),value)
             if once:
                 break
             self._sleep_remaining(start, period)
+        if (processed and self.config.publish_json and self._diagnostic_cycle != processed-1):
+            self._publish(perception)
+            self._publish_pipeline(perception, decision, trajectory, control, receipt, safety)
+        self.flush_diagnostics()
+
+    def flush_diagnostics(self, timeout=2.0):
+        return self._diagnostics.flush(timeout)
 
     def _trace_braking(self, perception, decision, trajectory, control, receipt, safety):
         """Retain brief brake events that fall between periodic log samples.
@@ -419,14 +473,15 @@ class CaptainRuntime(object):
                              trajectory.stop_distance, control.brake,
                              control.diagnostics.get("reference_speed_mps"),
                              safety.reason, receipt.get("reason"))
-            if self.config.publish_json and self._braking_event_count < 80:
+            full_event = event in ('brake_start','brake_release') or now >= self._diagnostic_event_next
+            if self.config.publish_json and full_event and self._braking_event_count < 80:
+                self._diagnostic_event_next = now+max(.5,getattr(self.config,'diagnostic_interval_s',.5))
                 self._braking_event_count += 1
                 directory = os.path.join(self.config.runtime_dir, "braking_events")
                 path = os.path.join(directory, "{0}-{1:03d}-{2}.json".format(
                     self.runtime_info["pid"], self._braking_event_count, perception.frame_id))
                 try:
-                    os.makedirs(directory, exist_ok=True)
-                    self._publish_json(path, {
+                    self._diagnostics.submit(path, {
                         "event": event, "runtime": dict(self.runtime_info),
                         "recorded_monotonic": now, "preceding_frames": list(self._braking_history),
                         "summary": brief, "perception": perception_to_dict(perception),
@@ -477,11 +532,19 @@ class CaptainRuntime(object):
         return self.stop_requested
 
     def _publish(self, perception):
-        return self._publish_json(self.snapshot_path, perception_to_dict(perception))
+        return self._diagnostics.submit(self.snapshot_path, perception_to_dict(perception))
 
     def _publish_pipeline(self, perception, decision, trajectory, control, receipt, safety):
-        return self._publish_json(self.pipeline_path, {
+        return self._diagnostics.submit(self.pipeline_path, {
             "runtime": dict(self.runtime_info),
+            "timings_ms": dict(self._loop_timing),
+            "timing_summary": to_dict(self._timing_summary),
+            "diagnostics_io": self._diagnostics.status(),
+            "tracking_measurements": self._tracking_measurements.summary(),
+            "behavior_input_readiness": dict(case_id=perception.case_id,task_id=perception.task_id,
+                behavior_model_status=self.configured_behaviors.status,
+                sensor_visibility_configured=bool(getattr(self.config,'sensor_visibility_file','')),
+                gps_pose_callback=self.adapter.gps_poses.status if hasattr(self.adapter,'gps_poses') else 'unavailable'),
             "parking_integration": {"configured": self.parking is not None,
                                     "reason": self.parking.reason if self.parking else "NOT_CONFIGURED"},
             "evaluation": self._evaluation_status(),
@@ -509,6 +572,18 @@ class CaptainRuntime(object):
         # Windows an open reader can temporarily prevent atomic replacement.
         # Never let this optional I/O failure terminate the driving loop.
         try:
+            # Installed task-cache reads also belong to the diagnostic worker.
+            readiness = data.get('behavior_input_readiness')
+            if path == self.pipeline_path and isinstance(readiness,dict):
+                task = (readiness['case_id'],readiness['task_id'])
+                if task != self._input_task or time.monotonic()>=self._input_retry_at:
+                    self._input_task = task
+                    self._input_readiness = installed_task_parameters(getattr(self.config,'sdk_dir',''),
+                        task[1],getattr(self.config,'vehicle_id','0'))
+                    self._input_retry_at = (float('inf') if self._input_readiness['status']=='TASK_PARAMETERS_FOUND'
+                                            else time.monotonic()+5.)
+                readiness['installed_parameters'] = self._input_readiness
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             temporary = path + ".tmp"
             with open(temporary, "w", encoding="utf-8") as stream:
                 json.dump(data, stream, ensure_ascii=False, indent=2,
