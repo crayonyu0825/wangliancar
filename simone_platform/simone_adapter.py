@@ -17,6 +17,7 @@ from simone_platform.sensor_catalog import (TARGET_INGESTION_VERSION, sensor_kin
                                            target_sensor_ids)
 from simone_platform.map_observations import MapObservationReader, vector_items
 from simone_platform.map_document import MapDocument
+from simone_platform.gps_pose_stream import GpsPoseStream
 
 
 def _decode_sdk_text(value):
@@ -109,6 +110,7 @@ class SimOneAdapter(object):
         self._target_log_signature = None
         self._target_log_time = 0.0
         self._evaluation = None
+        self.gps_poses = GpsPoseStream(getattr(config,'vehicle_id',''),getattr(config,'sensor_timeout_ms',500)/1000.)
 
     def bootstrap(self):
         sdk_dir = os.path.abspath(self.config.sdk_dir)
@@ -153,6 +155,9 @@ class SimOneAdapter(object):
                     self._evaluation.initialize(self.config.vehicle_id)
                 self.pnc_api.SoSetDriverName(self.config.vehicle_id, "Captain")
                 self._register_target_callback()
+                self.gps_poses.register(getattr(self.sensor_api,'SimoneAPI',None),
+                                        getattr(self.structs,'SimOne_Data_Gps',None),self.sdk_version)
+                self.logger.info('GPS 位姿回调 status=%s',self.gps_poses.status)
                 self.logger.info(
                     "已连接 SimOne: vehicle=%s server=%s",
                     self.config.vehicle_id,
@@ -221,6 +226,7 @@ class SimOneAdapter(object):
             result["case_name"] = _decode_sdk_text(data.caseName)
             result["case_id"] = _decode_sdk_text(data.caseId)
             result["task_id"] = _decode_sdk_text(data.taskId)
+        self.gps_poses.set_scope(result['case_id'],result['task_id'])
         return result
 
     def read_raw_snapshot(self):
@@ -234,6 +240,8 @@ class SimOneAdapter(object):
             result.update(self._read_reference_data())
             result.update(self._read_auxiliary_data(result.get("sensor_configurations", [])))
         result["source_status"] = copy.deepcopy(self._source_status)
+        result['source_status']['gps_pose_callback'] = {
+            'status':self.gps_poses.status, 'exact_sensor_pose_available':bool(result.get('sensor_pose_sample'))}
         return result
 
     def _read_raw_snapshot(self):
@@ -299,6 +307,8 @@ class SimOneAdapter(object):
                   if targets is not None else -1,
                   "errors": errors}
         result.update(reference)
+        self.gps_poses.set_installations(reference['sensor_configurations'],reference['sensor_configurations_valid'])
+        result['sensor_pose_sample'] = self.gps_poses.select(result['targets_frame'],result['targets_timestamp'])
         result.update(self._read_auxiliary_data(result["sensor_configurations"]))
         target_status.update({
             "read_ok": targets is not None, "source": source,
@@ -963,6 +973,7 @@ class SimOneAdapter(object):
         return self.pnc_api.SoSetSignalLights(self.config.vehicle_id, lights)
 
     def shutdown(self):
+        self.gps_poses.close()
         with self._target_lock:
             self._target_accepting = False
         if self.connected and self.service_api is not None:

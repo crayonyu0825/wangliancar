@@ -251,7 +251,10 @@ class PerceptionBuilder(object):
             result.valid_until = min(result.valid_until, time.monotonic() +
                                      max(0, timeout - result.ego.age_ms) / 1000.0)
         try:
-            result.maneuver_environment = self.maneuver_builder.build(result)
+            if raw.get('sensor_pose_sample') is not None:
+                result.maneuver_environment = self.maneuver_builder.build(result,raw['sensor_pose_sample'])
+            else:
+                result.maneuver_environment = self.maneuver_builder.build(result)
         except Exception as exc:
             # Optional new environment must not terminate the established
             # GPS/target/signal chain, nor masquerade as valid on failure.

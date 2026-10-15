@@ -113,6 +113,9 @@ class PlanningReplayIntegrationTests(unittest.TestCase):
     def _captured_pipeline(self, signal=False):
         project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         config = load_config(project)
+        # This offline recorder must inspect every cycle, independently of the
+        # production latest-snapshot interval. Keep all original replay checks.
+        config.diagnostic_interval_s = 0.0
         config.scene_id_override = 10 if signal else 1
         config.send_control = config.safety_brake_enabled = True
         config.control_calibrated = True

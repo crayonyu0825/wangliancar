@@ -103,4 +103,33 @@ class SensorPoseHistory(object):
             return None,"sensor_pose_history_plane_mismatch"
         result=copy.deepcopy(record)
         result["ego"]=SimpleNamespace(**result["pose"])
-        return result,"sensor_pose_history_exact_frame"
+        return result,('sensor_pose_history_exact_callback_frame' if record.get('source') ==
+                       'sdk_gps_callback' else 'sensor_pose_history_exact_frame')
+
+    def seed_callback(self,p,sample,now):
+        """Accept only the SDK callback's original header, scope, pose and TTL."""
+        if not isinstance(sample,dict):
+            return
+        try:
+            if (p.valid is not True or p.ego.valid is not True or now >= p.valid_until
+                    or self.high_frame != p.frame_id or self.high_timestamp != p.timestamp
+                    or sample.get('source') != 'sdk_gps_callback' or sample.get('consistent') is not True
+                    or tuple(sample['scope']) != (p.case_id,p.task_id,str(self.vehicle_id))
+                    or sample['frame_id'] != p.targets_frame_id or sample['timestamp'] != p.targets_timestamp
+                    or not 0 <= sample['frame_id'] < p.frame_id
+                    or not all(number(sample['pose'][k]) for k in POSE_FIELDS)
+                    or not all(number(sample[k]) for k in ('observed_at_s','valid_until_s'))
+                    or not sample['observed_at_s'] <= now < sample['valid_until_s']
+                    or sample['valid_until_s']-sample['observed_at_s'] > self.timeout_s+1e-9
+                    or sample['installations'] != _installations(p)):
+                return
+            previous = self.poses.get(sample['frame_id'])
+            if previous is not None:
+                if previous['pose'] != sample['pose'] or previous['timestamp'] != sample['timestamp']:
+                    previous['consistent'] = False
+                return
+            self.poses[sample['frame_id']] = copy.deepcopy(sample)
+            while len(self.poses)>MAX_POSES:
+                self.poses.popitem(last=False)
+        except (KeyError,ValueError,TypeError,OverflowError):
+            return

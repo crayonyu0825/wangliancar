@@ -49,6 +49,9 @@ class AppConfig(object):
         self.safety_emergency_brake = float(values.get("safety_emergency_brake", "1.0"))
         self.safety_recovery_frames = max(1, int(values.get("safety_recovery_frames", "3")))
         self.publish_json = _as_bool(values.get("publish_json", "true"))
+        self.diagnostic_interval_s = float(values.get('diagnostic_interval_s', '0.5'))
+        if not math.isfinite(self.diagnostic_interval_s) or self.diagnostic_interval_s < 0.1:
+            raise ValueError('diagnostic_interval_s must be finite and >= 0.1')
         self.log_level = values.get("log_level", "INFO").upper()
         self.runtime_dir = os.path.join(project_dir, "runtime_data")
 

@@ -75,6 +75,7 @@ class BrakingEventTests(unittest.TestCase):
                 c.brake, c.throttle, c.source = brake, 0 if brake else 0.2, 'control:TRACK'
                 c.diagnostics['reference_speed_mps'] = 0 if brake else 2.0
                 runtime._trace_braking(p, d, t, c, {'reason': 'sent'}, SafetyAssessment())
+            runtime.flush_diagnostics()
             files = sorted(glob.glob(os.path.join(directory, 'braking_events', '*.json')))
             self.assertEqual(2, len(files))
             with open(files[0], encoding='utf-8') as stream:
@@ -93,10 +94,12 @@ class BrakingEventTests(unittest.TestCase):
             receipt = {'reason': 'sent', 'ok': True}
             with patch.object(runtime, '_publish_json', side_effect=PermissionError('busy')):
                 runtime._trace_braking(p, d, t, c, receipt, SafetyAssessment())
+                runtime.flush_diagnostics()
             self.assertEqual((0.2, 0, True), (c.brake, c.throttle, receipt['ok']))
             with patch.object(runtime, '_publish_json', return_value=True) as publish:
                 for i in range(160):
                     c.brake = 0.2 if i % 2 else 0
                     runtime._trace_braking(p, d, t, c, receipt, SafetyAssessment())
+                runtime.flush_diagnostics()
                 self.assertLessEqual(publish.call_count, 79)
             self.assertEqual(8, len(runtime._braking_history))
