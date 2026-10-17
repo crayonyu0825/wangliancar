@@ -115,6 +115,20 @@ class TargetIngestionTests(unittest.TestCase):
         self.assertEqual("non_detection_sensors_only",
                          result[4]["sensor_catalog"]["status"])
 
+    def test_configured_type_map_makes_an_unrecognised_sensor_readable(self):
+        """The override must actually make the adapter read that sensor.
+
+        Reporting it is not enough: the point of the configuration is that a
+        platform naming difference stops costing every target scene its score.
+        """
+        self.config.sensor_type_map = {"objectbasedsensor": "perfect"}
+        self.responses["obj"] = packet()
+        result = self.adapter._read_target_sources(
+            catalog(("obj", "ObjectBasedSensor")), 10)
+        self.assertEqual(["obj"], self.calls)
+        self.assertEqual("sensor:obj", result[1])
+        self.assertEqual("configured", result[4]["sensor_presence"])
+
     def test_unrecognised_detection_type_is_not_reported_as_absent(self):
         """A naming difference must not look like a missing sensor.
 

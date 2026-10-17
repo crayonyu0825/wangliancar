@@ -1,28 +1,79 @@
 """Sensor capabilities from the bundled SDK's ESimOne_Node_Type enum."""
 
-TARGET_INGESTION_VERSION = "sensor-discovery-v3"
+TARGET_INGESTION_VERSION = "sensor-discovery-v4"
 
 # Kinds whose objects are read through the target detection API.
 DETECTION_KINDS = ("camera", "lidar", "perfect", "fusion")
 
+# Every kind this module may report. A configuration override may only map a
+# raw platform string onto one of these; it cannot invent a new kind.
+KNOWN_KINDS = DETECTION_KINDS + ("radar", "ultrasonic", "gnss", "v2x")
 
-def sensor_kind(value):
-    """Accept SDK numeric strings and platform names without guessing from IDs."""
+
+def sensor_kind(value, type_map=None):
+    """Accept SDK numeric strings and platform names without guessing from IDs.
+
+    `type_map` lets a deployed platform name a detection sensor differently
+    without a code change. It is matched before the built-in table, so a site
+    can correct a wrong guess (for example a platform whose "6" is a camera
+    rather than GNSS) without forking this module.
+    """
     if isinstance(value, bytes):
         value = value.split(b"\0", 1)[0].decode("utf-8", "replace")
-    value = str(getattr(value, "value", value)).strip().lower()
+    raw = str(getattr(value, "value", value)).strip()
+    if type_map:
+        mapped = type_map.get(raw.lower())
+        if mapped is not None:
+            return mapped
+    text = raw.lower()
     numeric = {"1": "camera", "2": "lidar", "3": "radar",
                "4": "ultrasonic", "5": "ultrasonic", "6": "gnss",
                "7": "perfect", "8": "v2x", "9": "fusion"}
-    if value in numeric:
-        return numeric[value]
+    if text in numeric:
+        return numeric[text]
     for word in ("ultrasonic", "perfect", "fusion", "camera", "lidar", "radar"):
-        if word in value:
+        if word in text:
             return word
     return "unknown"
 
 
-def target_sensor_ids(configurations, preferred=""):
+def parse_type_map(entries):
+    """Validate `raw=kind` overrides into a lowercase lookup.
+
+    Rejects rather than ignores: a mistyped override that silently did nothing
+    would look exactly like the mapping not being needed, which is the
+    confusion this whole report exists to remove.
+    """
+    if entries is None:
+        return {}
+    if isinstance(entries, dict):
+        items = entries.items()
+    elif isinstance(entries, str):
+        items = []
+        for chunk in entries.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "=" not in chunk:
+                raise ValueError("sensor type map entry {0!r} is not raw=kind".format(chunk))
+            raw, kind = chunk.split("=", 1)
+            items.append((raw, kind))
+    else:
+        raise ValueError("sensor type map must be a mapping or comma separated string")
+    result = {}
+    for raw, kind in items:
+        name = str(raw).strip().lower()
+        target = str(kind).strip().lower()
+        if not name:
+            raise ValueError("sensor type map has an empty raw type")
+        if target not in KNOWN_KINDS:
+            raise ValueError("sensor type map {0}={1!r} is not one of {2}".format(
+                name, target, "/".join(KNOWN_KINDS)))
+        result[name] = target
+    return result
+
+
+def target_sensor_ids(configurations, preferred="", type_map=None):
     """Configured detection sources only; GNSS/radar/ultrasound use other APIs."""
     ids = []
     for item in configurations:
@@ -30,7 +81,7 @@ def target_sensor_ids(configurations, preferred=""):
             continue
         identifier = item.get("id", "")
         if (isinstance(identifier, str) and identifier
-                and sensor_kind(item.get("type", "")) in DETECTION_KINDS
+                and sensor_kind(item.get("type", ""), type_map) in DETECTION_KINDS
                 and identifier not in ids):
             ids.append(identifier)
     if preferred in ids:
@@ -39,7 +90,7 @@ def target_sensor_ids(configurations, preferred=""):
     return ids
 
 
-def sensor_catalog_report(configurations):
+def sensor_catalog_report(configurations, type_map=None):
     """Describe configured sensors so an unrecognised type cannot hide.
 
     `target_sensor_ids` only returns sources whose type is understood, which is
@@ -59,7 +110,7 @@ def sensor_catalog_report(configurations):
             if not isinstance(item, dict):
                 continue
             raw_type = item.get("type", "")
-            kind = sensor_kind(raw_type)
+            kind = sensor_kind(raw_type, type_map)
             counts[kind] = counts.get(kind, 0) + 1
             sensors.append({
                 "id": item.get("id", ""),
@@ -86,4 +137,5 @@ def sensor_catalog_report(configurations):
         "detection_ids": detection,
         "unclassified": unclassified,
         "sensors": sensors,
+        "type_map": dict(type_map) if type_map else {},
     }

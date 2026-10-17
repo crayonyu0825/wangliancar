@@ -41,12 +41,12 @@ ego ✓  lane ✓  targets(非必需) ✓  signal(非必需) ✓  behaviour_mode
 
 ### "配置为空"有四种含义，原先被合并成一种
 
-`source_status.targets.sensor_presence` 现在区分（`sensor-discovery-v3`）：
+`source_status.targets.sensor_presence` 现在区分（`sensor-discovery-v4`）：
 
 | 取值 | 含义 | 修复方向 |
 | --- | --- | --- |
 | `configured` | 有可识别的检测源 | 正常，继续查读取 |
-| `unclassified_types` | **有传感器，但类型名未被识别**为 camera/lidar/perfect/fusion | 对 `sensor_catalog.sensors[].raw_type` 补类型名映射 |
+| `unclassified_types` | **有传感器，但类型名未被识别**为 camera/lidar/perfect/fusion | 加一行 `sensor_type_map` 配置（见下） |
 | `no_detection_sensor` | 只有雷达/GNSS/超声波等非检测源 | 平台需增加检测传感器 |
 | `not_configured` | 确实没有任何传感器 | 平台需配置传感器 |
 
@@ -56,13 +56,39 @@ ego ✓  lane ✓  targets(非必需) ✓  signal(非必需) ✓  behaviour_mode
 
 **目标读取规则不变**：未识别的类型仍然不会被当作目标源，安全原则没有放松。
 
+### 类型名不匹配可以只改配置，不用改代码
+
+`config/default.ini` 新增 `sensor_type_map`，把平台的原始类型名映射到已知种类：
+
+```ini
+[app]
+# 平台把检测传感器叫 ObjectBasedSensor，声明它是完美感知
+sensor_type_map = ObjectBasedSensor=perfect
+
+# 多项用逗号分隔
+sensor_type_map = ObjectBasedSensor=camera, PerfectPerception=perfect
+```
+
+允许的目标种类只有 `camera` / `lidar` / `perfect` / `fusion` / `radar` /
+`ultrasonic` / `gnss` / `v2x`，**写错会在启动时直接报错**，不会静默失效——
+静默失效会让人以为映射没用，而这恰是本报告要消除的困惑。
+
+映射同时作用于目标读取、`sensor_catalog` 报告和离线诊断脚本，三者不会各说各话。
+自带默认表保持为空，不改变现有行为。
+
+用法：
+
+1. 跑一次目标场景，看 `source_status.targets.sensor_catalog.unclassified[].raw_type`
+2. 若那里出现了本应是检测传感器的类型名，加一行 `sensor_type_map`
+3. 重跑，确认 `sensor_presence` 变成 `configured`
+
 ### 三条修法
 
 | 方案 | 做法 | 前置条件 |
 | --- | --- | --- |
 | A 补平台传感器（推荐） | 在 NEVC 平台给主车配置一个 camera/lidar/perfect/fusion 目标传感器 | 平台操作权限 |
 | B 允许真值兜底 | 让 `targets_usable()` 接受 `ground_truth` | **队长与赛方确认合规**；属决策组安全原则，需授权 |
-| C 对齐传感器 ID 或类型名 | 平台已配但 ID/类型名不匹配时改配置或补映射 | 先看 `sensor_catalog` 的 `raw_type` |
+| C 对齐传感器 ID 或类型名 | ID 不符改 `sensor_id`；类型名不符加 `sensor_type_map` | 先看 `sensor_catalog` 的 `raw_type` |
 
 方案 B 不可由单人决定：用真值等于完美感知，是否合规需赛方口径。而且它不是两行改动：
 `startswith("sensor:")` 这道门槛在决策、规划、感知可见性、运行监护等 **10 处以上**

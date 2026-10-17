@@ -129,6 +129,20 @@ class DiagnoseSceneTests(unittest.TestCase):
         self.assertIn("none resolves to a detection kind", gate["detail"])
         self.assertIn("ObjectBasedSensor", gate["detail"])
 
+    def test_configured_type_map_resolves_an_unrecognised_sensor(self):
+        """The offline report must honour the same override as the live adapter."""
+        payload = snapshot(scene=1, sensor_types=("ObjectBasedSensor",))
+        blocked = self.run_gates(payload)
+        self.assertIn("sensor_configuration", blocked["blockers"])
+
+        mapped = self.run_gates(
+            payload, SimpleNamespace(sensor_id="perfectPerception1",
+                                     behavior_model_file="",
+                                     sensor_type_map={"objectbasedsensor": "perfect"}))
+        self.assertNotIn("sensor_configuration", mapped["blockers"])
+        self.assertIn("configured detection sources",
+                      mapped["gates"]["sensor_configuration"]["detail"])
+
     def test_non_detection_sensors_are_a_different_blocker(self):
         report = self.run_gates(snapshot(scene=1, sensor_types=("3", "6")))
         gate = report["gates"]["sensor_configuration"]

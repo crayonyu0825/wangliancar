@@ -41,6 +41,42 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(0.0, output.brake)
         self.assertEqual(-1.0, output.steering)
 
+    def test_sensor_type_map_overrides_the_builtin_table(self):
+        """A platform naming its detection sensor differently must be fixable
+        by configuration, not by editing this module."""
+        from simone_platform.sensor_catalog import (parse_type_map, sensor_kind,
+                                                    sensor_catalog_report,
+                                                    target_sensor_ids)
+        configurations = [{"id": "obj1", "type": "ObjectBasedSensor"}]
+        self.assertEqual("unknown", sensor_kind("ObjectBasedSensor"))
+        self.assertEqual([], target_sensor_ids(configurations, ""))
+        self.assertEqual("unclassified_sensor_types_only",
+                         sensor_catalog_report(configurations)["status"])
+
+        mapping = parse_type_map("ObjectBasedSensor=perfect")
+        self.assertEqual("perfect", sensor_kind("ObjectBasedSensor", mapping))
+        self.assertEqual(["obj1"], target_sensor_ids(configurations, "", mapping))
+        self.assertEqual("detection_source_configured",
+                         sensor_catalog_report(configurations, mapping)["status"])
+
+    def test_sensor_type_map_rejects_invalid_entries(self):
+        from simone_platform.sensor_catalog import parse_type_map
+        for bad in ("Foo", "Foo=banana", "=camera", "Foo="):
+            with self.assertRaises(ValueError):
+                parse_type_map(bad)
+        self.assertEqual({}, parse_type_map(""))
+        self.assertEqual({}, parse_type_map(None))
+        self.assertEqual({"cam": "camera"},
+                         parse_type_map("Cam=Camera, "))
+
+    def test_sensor_type_map_is_loaded_and_validated_by_config(self):
+        from core.config import AppConfig
+        ok = AppConfig(".", {"sensor_type_map": "Obj=camera"})
+        self.assertEqual({"obj": "camera"}, ok.sensor_type_map)
+        self.assertEqual({}, AppConfig(".", {}).sensor_type_map)
+        with self.assertRaises(ValueError):
+            AppConfig(".", {"sensor_type_map": "Obj=notakind"})
+
 
 if __name__ == "__main__":
     unittest.main()

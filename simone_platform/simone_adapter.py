@@ -380,8 +380,10 @@ class SimOneAdapter(object):
         """Select a fresh official sensor stream, with bounded fallback probing."""
         now = time.monotonic()
         config_ok = reference["sensor_configurations_valid"]
-        configured = target_sensor_ids(reference["sensor_configurations"], self.config.sensor_id)
-        catalog = sensor_catalog_report(reference["sensor_configurations"])
+        type_map = getattr(self.config, "sensor_type_map", None)
+        configured = target_sensor_ids(reference["sensor_configurations"],
+                                      self.config.sensor_id, type_map)
+        catalog = sensor_catalog_report(reference["sensor_configurations"], type_map)
         with self._target_lock:
             streams = dict(self._target_streams)  # callback records are replaced, never mutated
         timeout = getattr(self.config, "sensor_timeout_ms", 500)

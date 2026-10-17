@@ -13,6 +13,11 @@ class AppConfig(object):
         self.server_ip = values.get("server_ip", "127.0.0.1")
         self.vehicle_id = values.get("vehicle_id", "0")
         self.sensor_id = values.get("sensor_id", "perfectPerception1")
+        # Optional `raw=kind` overrides for a platform that names its sensors
+        # differently. Validated here so a typo fails at startup instead of
+        # silently leaving target scenes with no readable source.
+        from simone_platform.sensor_catalog import parse_type_map
+        self.sensor_type_map = parse_type_map(values.get("sensor_type_map", "").strip())
         coverage = values.get("sensor_visibility_file", "").strip()
         self.sensor_visibility_file = (os.path.abspath(os.path.join(project_dir, coverage))
                                        if coverage else "")

@@ -143,11 +143,13 @@ def _sensor_config_gate(perception, config):
     if not ok:
         return _result(BLOCK, "platform sensor configurations not readable; a fresh "
                               "Sensor API frame cannot be discovered")
-    catalog = sensor_catalog_report(configurations if isinstance(configurations, list) else [])
+    type_map = getattr(config, "sensor_type_map", None)
+    catalog = sensor_catalog_report(configurations if isinstance(configurations, list) else [],
+                                    type_map)
     candidates = catalog["detection_ids"]
     if candidates:
         preferred = getattr(config, "sensor_id", "")
-        ordered = target_sensor_ids(configurations, preferred)
+        ordered = target_sensor_ids(configurations, preferred, type_map)
         return _result(PASS, "configured detection sources: " + ", ".join(ordered or candidates))
     if catalog["status"] == "unclassified_sensor_types_only":
         described = ", ".join("{0}={1!r}".format(item["id"], item["raw_type"])
