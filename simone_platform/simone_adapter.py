@@ -14,8 +14,8 @@ from core.map_scope import matches_lane
 from simone_platform.evaluation import LocalEvaluation
 from simone_platform.evaluation_records import EvaluationRecords,evaluation_directory
 from simone_platform.sdk_compat import polling_structs
-from simone_platform.sensor_catalog import (TARGET_INGESTION_VERSION, sensor_kind,
-                                           target_sensor_ids)
+from simone_platform.sensor_catalog import (TARGET_INGESTION_VERSION, sensor_catalog_report,
+                                           sensor_kind, target_sensor_ids)
 from simone_platform.map_observations import MapObservationReader, vector_items
 from simone_platform.map_document import MapDocument
 from simone_platform.gps_pose_stream import GpsPoseStream
@@ -381,6 +381,7 @@ class SimOneAdapter(object):
         now = time.monotonic()
         config_ok = reference["sensor_configurations_valid"]
         configured = target_sensor_ids(reference["sensor_configurations"], self.config.sensor_id)
+        catalog = sensor_catalog_report(reference["sensor_configurations"])
         with self._target_lock:
             streams = dict(self._target_streams)  # callback records are replaced, never mutated
         timeout = getattr(self.config, "sensor_timeout_ms", 500)
@@ -396,10 +397,22 @@ class SimOneAdapter(object):
         if preferred in candidates:
             candidates.remove(preferred)
             candidates.insert(0, preferred)
-        presence = "configured" if configured else ("unknown" if observed or not config_ok
-                                                    else "not_configured")
+        if configured:
+            presence = "configured"
+        elif observed or not config_ok:
+            presence = "unknown"
+        elif catalog["status"] == "unclassified_sensor_types_only":
+            # Sensors exist but none resolves to a detection kind. Reporting
+            # "not configured" here would hide a platform naming difference and
+            # send the reader looking for a missing sensor instead of a type.
+            presence = "unclassified_types"
+        elif catalog["status"] == "non_detection_sensors_only":
+            presence = "no_detection_sensor"
+        else:
+            presence = "not_configured"
         meta = {"version": TARGET_INGESTION_VERSION, "sensor_presence": presence,
                 "sensor_id": candidates[0] if candidates else "", "sensor_candidates": candidates,
+                "sensor_catalog": catalog,
                 "config_read_ok": config_ok,
                 "config_reason": reference.get("sensor_configurations_reason", "unknown"),
                 "callback_status": self._target_callback_status,

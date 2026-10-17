@@ -108,7 +108,30 @@ class TargetIngestionTests(unittest.TestCase):
         result = self.adapter._read_target_sources(catalog(("radar", "3")), 10)
         self.assertEqual([], self.calls)
         self.assertIsNone(result[0])
-        self.assertEqual("not_configured", result[4]["sensor_presence"])
+        # A radar-only vehicle, a vehicle with no sensors at all, and an
+        # unrecognised detection type are three different situations with
+        # three different fixes, so the report must not merge them.
+        self.assertEqual("no_detection_sensor", result[4]["sensor_presence"])
+        self.assertEqual("non_detection_sensors_only",
+                         result[4]["sensor_catalog"]["status"])
+
+    def test_unrecognised_detection_type_is_not_reported_as_absent(self):
+        """A naming difference must not look like a missing sensor.
+
+        The reading rule is unchanged: an unknown type is still not a target
+        source. The point is that the report distinguishes "the platform
+        published no detection sensor" from "it published one under a type this
+        binding does not know".
+        """
+        result = self.adapter._read_target_sources(
+            catalog(("obj", "ObjectBasedSensor")), 10)
+        self.assertEqual([], self.calls)
+        self.assertIsNone(result[0])
+        self.assertEqual("unclassified_types", result[4]["sensor_presence"])
+        report = result[4]["sensor_catalog"]
+        self.assertEqual("unclassified_sensor_types_only", report["status"])
+        self.assertEqual([], report["detection_ids"])
+        self.assertEqual("ObjectBasedSensor", report["unclassified"][0]["raw_type"])
 
     def test_missing_catalog_is_unknown_and_retries_are_bounded(self):
         with patch("simone_platform.simone_adapter.time.monotonic", return_value=10.0):

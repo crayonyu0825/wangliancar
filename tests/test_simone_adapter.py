@@ -96,7 +96,12 @@ class AdapterTests(unittest.TestCase):
         adapter.sensor_api.SoGetSensorDetections = lambda *args: calls.append(args) or False
         absent = adapter.read_raw_snapshot()
         self.assertEqual([], calls)
-        self.assertEqual("not_configured", absent["source_status"]["targets"]["sensor_presence"])
+        # Radar is a real sensor but not a detection source, which is distinct
+        # from having no sensors and from an unrecognised detection type.
+        self.assertEqual("no_detection_sensor",
+                         absent["source_status"]["targets"]["sensor_presence"])
+        self.assertEqual("non_detection_sensors_only",
+                         absent["source_status"]["targets"]["sensor_catalog"]["status"])
         self.assertEqual("", absent["source_status"]["targets"]["sensor_id"])
 
     def test_traffic_uses_lane_stopline_and_caches_map_lookup(self):

@@ -118,8 +118,21 @@ class DiagnoseSceneTests(unittest.TestCase):
     def test_missing_sensor_configuration_is_reported_separately(self):
         report = self.run_gates(snapshot(scene=1, sensor_types=()))
         self.assertIn("sensor_configuration", report["blockers"])
-        self.assertIn("no camera/lidar/fusion/perfect", 
+        self.assertIn("no detection sensor",
                       report["gates"]["sensor_configuration"]["detail"])
+
+    def test_unrecognised_detection_type_names_the_raw_type(self):
+        """The field reader must see the type string, not a silent absence."""
+        report = self.run_gates(snapshot(scene=1, sensor_types=("ObjectBasedSensor",)))
+        gate = report["gates"]["sensor_configuration"]
+        self.assertEqual(diagnose_scene.BLOCK, gate["status"])
+        self.assertIn("none resolves to a detection kind", gate["detail"])
+        self.assertIn("ObjectBasedSensor", gate["detail"])
+
+    def test_non_detection_sensors_are_a_different_blocker(self):
+        report = self.run_gates(snapshot(scene=1, sensor_types=("3", "6")))
+        gate = report["gates"]["sensor_configuration"]
+        self.assertIn("only non-detection sensors", gate["detail"])
 
     def test_lane_only_scene_needs_no_targets(self):
         report = self.run_gates(snapshot(scene=6, source="none",

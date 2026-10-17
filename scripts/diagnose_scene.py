@@ -31,7 +31,7 @@ from core.interfaces import EgoState, LaneContext, Perception, Target, TrafficCo
 from core.scene_requirements import (  # noqa: E402
     AEB_SCENES, FOLLOW_SCENES, SIGNAL_SCENES, requires_targets)
 from core.validation import current  # noqa: E402
-from simone_platform.sensor_catalog import target_sensor_ids  # noqa: E402
+from simone_platform.sensor_catalog import sensor_catalog_report, target_sensor_ids  # noqa: E402
 
 
 DEFAULT_SNAPSHOT = os.path.join(PROJECT_DIR, "runtime_data", "latest_perception.json")
@@ -135,20 +135,31 @@ def _target_gate(perception):
 
 
 def _sensor_config_gate(perception, config):
-    """Whether the platform published a configured detection source at all."""
+    """Whether the platform published a usable detection source."""
     configurations = perception.sensor_configurations
     ok = perception.sensor_configurations_valid is True
-    candidates = target_sensor_ids(configurations, getattr(config, "sensor_id", "")) \
-        if ok and isinstance(configurations, list) else []
     if not requires_targets(perception.scene_id):
         return _result(PASS, "not required for this scene")
     if not ok:
         return _result(BLOCK, "platform sensor configurations not readable; a fresh "
                               "Sensor API frame cannot be discovered")
-    if not candidates:
-        return _result(BLOCK, "platform published no camera/lidar/fusion/perfect "
-                              "detection source for this task")
-    return _result(PASS, "configured detection sources: " + ", ".join(candidates))
+    catalog = sensor_catalog_report(configurations if isinstance(configurations, list) else [])
+    candidates = catalog["detection_ids"]
+    if candidates:
+        preferred = getattr(config, "sensor_id", "")
+        ordered = target_sensor_ids(configurations, preferred)
+        return _result(PASS, "configured detection sources: " + ", ".join(ordered or candidates))
+    if catalog["status"] == "unclassified_sensor_types_only":
+        described = ", ".join("{0}={1!r}".format(item["id"], item["raw_type"])
+                              for item in catalog["unclassified"][:6])
+        return _result(BLOCK, "sensors exist but none resolves to a detection kind "
+                              "(camera/lidar/perfect/fusion): {0}".format(described))
+    if catalog["status"] == "non_detection_sensors_only":
+        return _result(BLOCK, "only non-detection sensors are configured "
+                              "({0}); these use other APIs, not the target API".format(
+                                  ", ".join(sorted(catalog["counts_by_kind"]))))
+    return _result(BLOCK, "platform published no detection sensor "
+                          "({0} sensor(s) total)".format(catalog["count"]))
 
 
 def _ego_gate(perception):

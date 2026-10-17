@@ -39,15 +39,34 @@ ego ✓  lane ✓  targets(非必需) ✓  signal(非必需) ✓  behaviour_mode
 补充证据：`perception/SCENE_DATA_ACCEPTANCE.md:7` 已记录
 "01 的两次输入检查未取得正式 Sensor API 目标包，**平台下发的主车传感器配置及节点为空**"。
 
+### "配置为空"有四种含义，原先被合并成一种
+
+`source_status.targets.sensor_presence` 现在区分（`sensor-discovery-v3`）：
+
+| 取值 | 含义 | 修复方向 |
+| --- | --- | --- |
+| `configured` | 有可识别的检测源 | 正常，继续查读取 |
+| `unclassified_types` | **有传感器，但类型名未被识别**为 camera/lidar/perfect/fusion | 对 `sensor_catalog.sensors[].raw_type` 补类型名映射 |
+| `no_detection_sensor` | 只有雷达/GNSS/超声波等非检测源 | 平台需增加检测传感器 |
+| `not_configured` | 确实没有任何传感器 | 平台需配置传感器 |
+
+这个区分很重要：`unclassified_types` 的修复成本远低于补装传感器，而原先它会被
+误报成"平台没配传感器"，把排查引向错误方向。`sensor_catalog` 字段同时给出
+每个传感器的 `id`、`kind` 和 `raw_type`。
+
+**目标读取规则不变**：未识别的类型仍然不会被当作目标源，安全原则没有放松。
+
 ### 三条修法
 
 | 方案 | 做法 | 前置条件 |
 | --- | --- | --- |
 | A 补平台传感器（推荐） | 在 NEVC 平台给主车配置一个 camera/lidar/perfect/fusion 目标传感器 | 平台操作权限 |
 | B 允许真值兜底 | 让 `targets_usable()` 接受 `ground_truth` | **队长与赛方确认合规**；属决策组安全原则，需授权 |
-| C 对齐传感器 ID | 平台已配但 ID 不是 `perfectPerception1` 时改配置或环境变量 | 先确认平台实际 ID |
+| C 对齐传感器 ID 或类型名 | 平台已配但 ID/类型名不匹配时改配置或补映射 | 先看 `sensor_catalog` 的 `raw_type` |
 
-方案 B 不可由单人决定：用真值等于完美感知，是否合规需赛方口径。
+方案 B 不可由单人决定：用真值等于完美感知，是否合规需赛方口径。而且它不是两行改动：
+`startswith("sensor:")` 这道门槛在决策、规划、感知可见性、运行监护等 **10 处以上**
+同时存在，放开真值等于改全线语义，需整体评审。
 
 ## 7/8 为什么 0 分：泊车能力根本没启用
 
