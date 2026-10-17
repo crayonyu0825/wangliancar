@@ -30,6 +30,7 @@ from core.config import load_config  # noqa: E402
 from core.interfaces import EgoState, LaneContext, Perception, Target, TrafficControl  # noqa: E402
 from core.scene_requirements import (  # noqa: E402
     AEB_SCENES, FOLLOW_SCENES, SIGNAL_SCENES, requires_targets)
+from core.validation import current  # noqa: E402
 from simone_platform.sensor_catalog import target_sensor_ids  # noqa: E402
 
 
@@ -151,7 +152,6 @@ def _sensor_config_gate(perception, config):
 
 
 def _ego_gate(perception):
-    from core.validation import current
     if not current(perception):
         return _result(BLOCK, "captain frame expired (valid_until is process-local; a "
                               "saved snapshot always fails this)")
