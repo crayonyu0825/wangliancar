@@ -9,7 +9,7 @@ import time
 
 
 class LocalEvaluation(object):
-    def __init__(self, library, version, logger, interval_sec=1.0):
+    def __init__(self, library, version, logger, interval_sec=1.0, records=None):
         if isinstance(version, bytes):
             version = version.decode("ascii")
         # Later SDKs add another bool argument. Never call an unverified ABI.
@@ -31,6 +31,13 @@ class LocalEvaluation(object):
         self.last_save_ok = None
         self.error = ""
         self._next_save = 0.0
+        self.records = records
+
+    def bind_task(self,task_id):
+        if self.records is not None:self.records.bind_task(task_id)
+
+    def close(self):
+        if self.records is not None:self.records.close()
 
     def initialize(self, vehicle_id):
         if self.active:
@@ -49,17 +56,29 @@ class LocalEvaluation(object):
         now = time.monotonic()
         if not force and now < self._next_save:
             return True
+        if self.records is not None and not self.records.begin_save(force):
+            self._next_save = now+.1
+            if force:
+                self.error,self.last_save_ok = self.records.error,False
+            return not force
         self._next_save = now + self.interval_sec
         previous = self.last_save_ok
         try:
             ok = bool(self._save())
             self.error = "" if ok else "save_returned_false"
+            if ok:
+                self.save_count += 1
+                if self.records is not None:
+                    ok = self.records.saved(self.save_count,force)
+                    if not ok:self.error = self.records.error
         except Exception as exc:
             ok = False
             self.error = "save_exception:" + type(exc).__name__
+        finally:
+            if self.records is not None:self.records.end_save()
         self.last_save_ok = ok
         if ok:
-            self.save_count += 1
+            if not force and self.records is not None:self.records.request()
             if force or previous is not True:
                 self.logger.info("评价记录已保存 count=%s final=%s",
                                  self.save_count, force)
@@ -68,6 +87,8 @@ class LocalEvaluation(object):
         return ok
 
     def status(self):
-        return {"enabled": True, "mode": "local", "initialized": self.active,
+        result = {"enabled": True, "mode": "local", "initialized": self.active,
                 "save_count": self.save_count, "last_save_ok": self.last_save_ok,
                 "error": self.error}
+        if self.records is not None:result['record_delivery'] = self.records.status()
+        return result

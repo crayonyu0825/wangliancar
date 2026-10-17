@@ -12,6 +12,7 @@ import time
 from core.interfaces import ControlOut
 from core.map_scope import matches_lane
 from simone_platform.evaluation import LocalEvaluation
+from simone_platform.evaluation_records import EvaluationRecords,evaluation_directory
 from simone_platform.sdk_compat import polling_structs
 from simone_platform.sensor_catalog import (TARGET_INGESTION_VERSION, sensor_kind,
                                            target_sensor_ids)
@@ -133,7 +134,9 @@ class SimOneAdapter(object):
         if getattr(self.config, "evaluation_enabled", True):
             self._evaluation = LocalEvaluation(
                 self.service_api.SimoneAPI, version, self.logger,
-                getattr(self.config, "evaluation_flush_interval_sec", 1.0))
+                getattr(self.config, "evaluation_flush_interval_sec", 1.0),
+                records=EvaluationRecords(evaluation_directory(self.config),
+                    os.path.join(self.config.runtime_dir,'evaluation_raw'),self.logger))
         if repairs:
             self.logger.warning("已修正 SDK %s 轮询结构布局: %s",
                                 _decode_sdk_text(version), ", ".join(repairs))
@@ -227,6 +230,7 @@ class SimOneAdapter(object):
             result["case_id"] = _decode_sdk_text(data.caseId)
             result["task_id"] = _decode_sdk_text(data.taskId)
         self.gps_poses.set_scope(result['case_id'],result['task_id'])
+        if self._evaluation is not None:self._evaluation.bind_task(result['task_id'])
         return result
 
     def read_raw_snapshot(self):
@@ -988,6 +992,7 @@ class SimOneAdapter(object):
                     self.connected = False
                     if self._evaluation is not None:
                         self._evaluation.active = False
+                        self._evaluation.close()
                     with self._target_lock:
                         self._target_streams.clear()
                     self._target_probe_after.clear()
