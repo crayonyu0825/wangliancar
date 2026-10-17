@@ -30,6 +30,9 @@ class AppConfig(object):
         self.scene_id_override = int(values.get("scene_id_override", "0"))
         self.send_control = _as_bool(values.get("send_control", "false"))
         self.evaluation_enabled = _as_bool(values.get("evaluation_enabled", "true"))
+        evaluation_dir = values.get('evaluation_record_dir','').strip()
+        self.evaluation_record_dir = (os.path.abspath(os.path.join(project_dir,evaluation_dir))
+                                      if evaluation_dir else '')
         self.evaluation_flush_interval_sec = float(
             values.get("evaluation_flush_interval_sec", "1.0"))
         if (not math.isfinite(self.evaluation_flush_interval_sec) or
